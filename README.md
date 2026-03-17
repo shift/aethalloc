@@ -115,10 +115,10 @@ AethAlloc achieves parity or better with glibc in key workloads while using sign
 
 | Benchmark | glibc | AethAlloc | Ratio | Winner |
 |-----------|-------|-----------|-------|--------|
-| Packet Churn | 198K ops/s | 209K ops/s | 106% | AethAlloc |
-| KV Store | 262K ops/s | 296K ops/s | 113% | AethAlloc |
-| Fragmentation | 250K ops/s | 163K ops/s | 65% | glibc |
-| Multithread (8T) | 6.1M ops/s | 4.8M ops/s | 79% | glibc |
+| Packet Churn | 186K ops/s | 198K ops/s | 106% | AethAlloc |
+| KV Store | 260K ops/s | 257K ops/s | 99% | Tie |
+| Fragmentation | 246K ops/s | 141K ops/s | 57% | glibc |
+| Multithread (8T) | 7.9M ops/s | 6.7M ops/s | 85% | glibc |
 
 ### Packet Churn (Network Processing)
 
@@ -126,10 +126,10 @@ Simulates network packet processing with 64-byte allocations.
 
 | Metric | glibc | AethAlloc | Delta |
 |--------|-------|-----------|-------|
-| Throughput | 198,517 ops/s | 209,456 ops/s | +5.5% |
-| P50 latency | 4,544 ns | 4,167 ns | -8% |
-| P95 latency | 6,659 ns | 6,081 ns | -9% |
-| P99 latency | 10,688 ns | 10,758 ns | +1% |
+| Throughput | 185,984 ops/s | 198,157 ops/s | +7% |
+| P50 latency | 4,650 ns | 4,395 ns | -5% |
+| P95 latency | 5,578 ns | 5,512 ns | -1% |
+| P99 latency | 7,962 ns | 7,671 ns | -4% |
 
 ### KV Store (Redis-like Workload)
 
@@ -137,10 +137,10 @@ Variable-sized keys (8-64B) and values (16-64KB).
 
 | Metric | glibc | AethAlloc | Delta |
 |--------|-------|-----------|-------|
-| Throughput | 262,169 ops/s | 295,864 ops/s | +13% |
-| SET latency | 5,266 ns | 4,592 ns | -13% |
-| GET latency | 684 ns | 678 ns | -1% |
-| DEL latency | 1,165 ns | 852 ns | -27% |
+| Throughput | 260,276 ops/s | 257,082 ops/s | -1% |
+| SET latency | 5,296 ns | 5,302 ns | 0% |
+| GET latency | 703 ns | 758 ns | +8% |
+| DEL latency | 1,169 ns | 968 ns | -17% |
 
 ### Fragmentation (Long-running Server)
 
@@ -148,7 +148,7 @@ Mixed allocation sizes (16B - 1MB) over 1M iterations.
 
 | Metric | glibc | AethAlloc | Delta |
 |--------|-------|-----------|-------|
-| Throughput | 250,321 ops/s | 163,174 ops/s | -35% |
+| Throughput | 245,905 ops/s | 140,528 ops/s | -43% |
 | RSS growth | 218,624 KB | 18,592 KB | -91% |
 
 ### Multithread Churn (8 Threads)
@@ -157,8 +157,8 @@ Concurrent allocations (16B - 4KB) across 8 threads.
 
 | Metric | glibc | AethAlloc | Delta |
 |--------|-------|-----------|-------|
-| Throughput | 6.06M ops/s | 4.83M ops/s | -20% |
-| Avg latency | 824 ns | 1,229 ns | +49% |
+| Throughput | 7.88M ops/s | 6.73M ops/s | -15% |
+| Avg latency | 690 ns | 754 ns | +9% |
 
 ### Single-Thread Cache
 
@@ -207,7 +207,7 @@ cargo bench -p aethalloc-amo
 | 6 | VM page compaction | ✅ Complete |
 | 7 | Hardware safety (MTE/CHERI) | ✅ Complete |
 | 8 | Benchmarks & stress tests | ✅ Complete |
-| 9 | Performance optimization | ✅ Complete (beats glibc in 2/4 benchmarks) |
+| 9 | Performance optimization | ✅ Complete (beats glibc in packet_churn, 85% multithread) |
 
 ### Recent Optimizations
 
@@ -216,6 +216,7 @@ cargo bench -p aethalloc-amo
 | 6e229fd | Thread-local cache isolation | Fixed crashes with >1 thread |
 | 0662bba | Batch allocation (slab-style) | 3x memory reduction |
 | 2696124 | 64KB cache (13 size classes) | +80% kv_store throughput |
+| 037c005 | Remove global atomic counters | 79% → 85% multithread performance |
 
 ### Future Optimization Phases
 
