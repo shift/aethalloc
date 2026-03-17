@@ -1,8 +1,8 @@
 //! Global allocator implementation with thread-local caching
 //!
-//! Uses page-level metadata for large allocations and thread-local
-//! free lists for small allocations. Metrics are thread-local to avoid
-//! MESI cache line bouncing.
+//! Two modes available via feature flags:
+//! - simple-cache (default): Thread-local free-list per size class
+//! - magazine-caching: Hoard-style magazines for cross-thread transfers
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
@@ -10,6 +10,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
+
+#[cfg(feature = "magazine-caching")]
+use aethalloc_core::magazine::{GlobalMagazinePools, Magazine, MagazineNode};
 
 const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
@@ -29,8 +32,10 @@ struct PageHeader {
 const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
 const CACHE_HEADER_SIZE: usize = core::mem::size_of::<usize>();
 
-/// Global aggregated metrics (updated periodically from thread-locals)
 pub static GLOBAL_METRICS: GlobalMetrics = GlobalMetrics::new();
+
+#[cfg(feature = "magazine-caching")]
+pub static GLOBAL_MAGAZINES: GlobalMagazinePools = GlobalMagazinePools::new();
 
 pub struct GlobalMetrics {
     pub allocs: AtomicU64,
@@ -73,7 +78,6 @@ pub struct MetricsSnapshot {
     pub direct_allocs: u64,
 }
 
-/// Thread-local metrics (zero contention - plain usize, no atomics)
 struct ThreadMetrics {
     allocs: usize,
     frees: usize,
@@ -120,15 +124,42 @@ impl ThreadMetrics {
     }
 }
 
-/// Thread-local cache of free blocks per size class
+#[inline]
+fn size_to_class(size: usize) -> Option<usize> {
+    let rounded = round_up_pow2(size).max(16);
+    match rounded {
+        16 => Some(0),
+        32 => Some(1),
+        64 => Some(2),
+        128 => Some(3),
+        256 => Some(4),
+        512 => Some(5),
+        1024 => Some(6),
+        2048 => Some(7),
+        4096 => Some(8),
+        8192 => Some(9),
+        16384 => Some(10),
+        32768 => Some(11),
+        65536 => Some(12),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// SIMPLE-CACHE MODE: Thread-local free-list per size class
+// ============================================================================
+
+#[cfg(not(feature = "magazine-caching"))]
 struct ThreadCache {
     heads: [*mut u8; NUM_SIZE_CLASSES],
     counts: [usize; NUM_SIZE_CLASSES],
     metrics: ThreadMetrics,
 }
 
+#[cfg(not(feature = "magazine-caching"))]
 unsafe impl Send for ThreadCache {}
 
+#[cfg(not(feature = "magazine-caching"))]
 impl ThreadCache {
     const fn new() -> Self {
         Self {
@@ -137,37 +168,56 @@ impl ThreadCache {
             metrics: ThreadMetrics::new(),
         }
     }
-
-    #[inline]
-    fn size_to_class(size: usize) -> Option<usize> {
-        let rounded = round_up_pow2(size).max(16);
-        match rounded {
-            16 => Some(0),
-            32 => Some(1),
-            64 => Some(2),
-            128 => Some(3),
-            256 => Some(4),
-            512 => Some(5),
-            1024 => Some(6),
-            2048 => Some(7),
-            4096 => Some(8),
-            8192 => Some(9),
-            16384 => Some(10),
-            32768 => Some(11),
-            65536 => Some(12),
-            _ => None,
-        }
-    }
 }
 
-/// Thread-local storage
+#[cfg(not(feature = "magazine-caching"))]
 #[thread_local]
 static mut THREAD_CACHE: ThreadCache = ThreadCache::new();
 
+#[cfg(not(feature = "magazine-caching"))]
 #[inline(always)]
 unsafe fn get_thread_cache() -> &'static mut ThreadCache {
     &mut *core::ptr::addr_of_mut!(THREAD_CACHE)
 }
+
+// ============================================================================
+// MAGAZINE-CACHING MODE: Hoard-style magazines with global pool
+// ============================================================================
+
+#[cfg(feature = "magazine-caching")]
+struct ThreadCache {
+    alloc_mags: [Magazine; NUM_SIZE_CLASSES],
+    free_mags: [Magazine; NUM_SIZE_CLASSES],
+    metrics: ThreadMetrics,
+}
+
+#[cfg(feature = "magazine-caching")]
+unsafe impl Send for ThreadCache {}
+
+#[cfg(feature = "magazine-caching")]
+impl ThreadCache {
+    const fn new() -> Self {
+        Self {
+            alloc_mags: [const { Magazine::new() }; NUM_SIZE_CLASSES],
+            free_mags: [const { Magazine::new() }; NUM_SIZE_CLASSES],
+            metrics: ThreadMetrics::new(),
+        }
+    }
+}
+
+#[cfg(feature = "magazine-caching")]
+#[thread_local]
+static mut THREAD_CACHE: ThreadCache = ThreadCache::new();
+
+#[cfg(feature = "magazine-caching")]
+#[inline(always)]
+unsafe fn get_thread_cache() -> &'static mut ThreadCache {
+    &mut *core::ptr::addr_of_mut!(THREAD_CACHE)
+}
+
+// ============================================================================
+// Common allocator struct
+// ============================================================================
 
 pub struct AethAlloc;
 
@@ -188,6 +238,11 @@ impl AethAlloc {
     }
 }
 
+// ============================================================================
+// SIMPLE-CACHE MODE: GlobalAlloc implementation
+// ============================================================================
+
+#[cfg(not(feature = "magazine-caching"))]
 unsafe impl GlobalAlloc for AethAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
@@ -197,56 +252,45 @@ unsafe impl GlobalAlloc for AethAlloc {
             return core::ptr::null_mut();
         }
 
-        // Small allocation with standard alignment - use thread cache
         if size <= MAX_CACHE_SIZE && align <= 8 {
             let cache = get_thread_cache();
             let cache_size = round_up_pow2(size).max(16);
 
-            if let Some(class) = ThreadCache::size_to_class(cache_size) {
+            if let Some(class) = size_to_class(cache_size) {
                 let head = cache.heads[class];
 
                 if !head.is_null() {
-                    // Pop from free list (cache hit)
                     let next = core::ptr::read(head as *mut *mut u8);
                     cache.heads[class] = next;
                     cache.counts[class] -= 1;
                     cache.metrics.cache_hits += 1;
                     cache.metrics.allocs += 1;
                     cache.metrics.maybe_flush();
-
-                    // Store size and return
                     core::ptr::write(head as *mut usize, size);
                     return head.add(CACHE_HEADER_SIZE);
                 }
 
-                // Cache miss - need fresh allocation
                 cache.metrics.cache_misses += 1;
                 cache.metrics.allocs += 1;
 
-                // Batch-allocate: carve one page into multiple blocks
                 let block_size = cache_size + CACHE_HEADER_SIZE;
                 let blocks_per_page = PAGE_SIZE / block_size;
 
                 if blocks_per_page > 1 {
                     if let Some(base) = PageAllocator::alloc(1) {
                         let base_ptr = base.as_ptr();
-
-                        // Add all blocks except first to free list
                         for i in 1..blocks_per_page {
                             let block_ptr = base_ptr.add(i * block_size);
                             core::ptr::write(block_ptr as *mut *mut u8, cache.heads[class]);
                             cache.heads[class] = block_ptr;
                             cache.counts[class] += 1;
                         }
-
-                        // Return first block
                         core::ptr::write(base_ptr as *mut usize, size);
                         cache.metrics.maybe_flush();
                         return base_ptr.add(CACHE_HEADER_SIZE);
                     }
                 }
 
-                // Fallback for large blocks that don't fit well in a page
                 let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
                     let size_ptr = base.as_ptr() as *mut usize;
@@ -258,7 +302,6 @@ unsafe impl GlobalAlloc for AethAlloc {
             }
         }
 
-        // Direct (large) allocation
         let cache = get_thread_cache();
         cache.metrics.direct_allocs += 1;
         cache.metrics.allocs += 1;
@@ -270,7 +313,6 @@ unsafe impl GlobalAlloc for AethAlloc {
         match PageAllocator::alloc(pages) {
             Some(base) => {
                 let base_addr = base.as_ptr() as usize;
-
                 let header = PageHeader {
                     magic: MAGIC,
                     num_pages: pages as u16,
@@ -278,7 +320,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                 };
                 let header_ptr = base.as_ptr() as *mut PageHeader;
                 core::ptr::write(header_ptr, header);
-
                 let user_addr = Self::align_up(base_addr + PAGE_HEADER_SIZE, align);
                 user_addr as *mut u8
             }
@@ -294,18 +335,17 @@ unsafe impl GlobalAlloc for AethAlloc {
         let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
         let maybe_size = core::ptr::read(size_ptr);
 
-        // Check if this is a small allocation
         if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
             let potential_header = size_ptr as *mut PageHeader;
             if core::ptr::read(potential_header).magic != MAGIC {
                 let cache = get_thread_cache();
                 let cache_size = round_up_pow2(maybe_size).max(16);
 
-                if let Some(_class) = ThreadCache::size_to_class(cache_size) {
+                if let Some(class) = size_to_class(cache_size) {
                     let head_ptr = size_ptr as *mut *mut u8;
-                    core::ptr::write(head_ptr, cache.heads[_class]);
-                    cache.heads[_class] = size_ptr as *mut u8;
-                    cache.counts[_class] += 1;
+                    core::ptr::write(head_ptr, cache.heads[class]);
+                    cache.heads[class] = size_ptr as *mut u8;
+                    cache.counts[class] += 1;
                     cache.metrics.frees += 1;
                     cache.metrics.maybe_flush();
                     return;
@@ -313,7 +353,168 @@ unsafe impl GlobalAlloc for AethAlloc {
             }
         }
 
-        // Large allocation - find page header and free
+        let header = Self::page_header_from_ptr(ptr);
+        let header_ref = core::ptr::read(header);
+
+        if header_ref.magic == MAGIC && header_ref.num_pages > 0 {
+            let base = NonNull::new_unchecked(header as *mut u8);
+            PageAllocator::dealloc(base, header_ref.num_pages as usize);
+        }
+
+        let cache = get_thread_cache();
+        cache.metrics.frees += 1;
+        cache.metrics.maybe_flush();
+    }
+}
+
+// ============================================================================
+// MAGAZINE-CACHING MODE: GlobalAlloc implementation
+// ============================================================================
+
+#[cfg(feature = "magazine-caching")]
+unsafe impl GlobalAlloc for AethAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size();
+        let align = layout.align();
+
+        if size == 0 {
+            return core::ptr::null_mut();
+        }
+
+        if size <= MAX_CACHE_SIZE && align <= 8 {
+            let cache = get_thread_cache();
+            let cache_size = round_up_pow2(size).max(16);
+
+            if let Some(class) = size_to_class(cache_size) {
+                // Try local alloc magazine
+                if let Some(block) = cache.alloc_mags[class].pop() {
+                    cache.metrics.cache_hits += 1;
+                    cache.metrics.allocs += 1;
+                    cache.metrics.maybe_flush();
+                    core::ptr::write(block as *mut usize, size);
+                    return block.add(CACHE_HEADER_SIZE);
+                }
+
+                // Try to get a full magazine from global pool
+                if let Some(node_ptr) = GLOBAL_MAGAZINES.get(class).pop() {
+                    let node = &mut *node_ptr;
+                    core::mem::swap(&mut cache.alloc_mags[class], &mut node.magazine);
+                    node.magazine.clear();
+                    GLOBAL_MAGAZINES.get(class).push(node_ptr);
+
+                    if let Some(block) = cache.alloc_mags[class].pop() {
+                        cache.metrics.cache_hits += 1;
+                        cache.metrics.allocs += 1;
+                        cache.metrics.maybe_flush();
+                        core::ptr::write(block as *mut usize, size);
+                        return block.add(CACHE_HEADER_SIZE);
+                    }
+                }
+
+                // Cache miss - allocate fresh blocks
+                cache.metrics.cache_misses += 1;
+                cache.metrics.allocs += 1;
+
+                let block_size = cache_size + CACHE_HEADER_SIZE;
+                let blocks_per_page = PAGE_SIZE / block_size;
+
+                if blocks_per_page > 1 {
+                    if let Some(base) = PageAllocator::alloc(1) {
+                        let base_ptr = base.as_ptr();
+                        for i in 1..blocks_per_page {
+                            let block_ptr = base_ptr.add(i * block_size);
+                            let _ = cache.alloc_mags[class].push(block_ptr);
+                        }
+                        core::ptr::write(base_ptr as *mut usize, size);
+                        cache.metrics.maybe_flush();
+                        return base_ptr.add(CACHE_HEADER_SIZE);
+                    }
+                }
+
+                let pages = block_size.div_ceil(PAGE_SIZE).max(1);
+                if let Some(base) = PageAllocator::alloc(pages) {
+                    let size_ptr = base.as_ptr() as *mut usize;
+                    core::ptr::write(size_ptr, size);
+                    cache.metrics.maybe_flush();
+                    return size_ptr.add(1) as *mut u8;
+                }
+                return core::ptr::null_mut();
+            }
+        }
+
+        let cache = get_thread_cache();
+        cache.metrics.direct_allocs += 1;
+        cache.metrics.allocs += 1;
+        cache.metrics.maybe_flush();
+
+        let min_size = PAGE_HEADER_SIZE + size + align;
+        let pages = min_size.div_ceil(PAGE_SIZE).max(1);
+
+        match PageAllocator::alloc(pages) {
+            Some(base) => {
+                let base_addr = base.as_ptr() as usize;
+                let header = PageHeader {
+                    magic: MAGIC,
+                    num_pages: pages as u16,
+                    requested_size: size,
+                };
+                let header_ptr = base.as_ptr() as *mut PageHeader;
+                core::ptr::write(header_ptr, header);
+                let user_addr = Self::align_up(base_addr + PAGE_HEADER_SIZE, align);
+                user_addr as *mut u8
+            }
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+
+        let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
+        let maybe_size = core::ptr::read(size_ptr);
+
+        if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
+            let potential_header = size_ptr as *mut PageHeader;
+            if core::ptr::read(potential_header).magic != MAGIC {
+                let cache = get_thread_cache();
+                let cache_size = round_up_pow2(maybe_size).max(16);
+
+                if let Some(class) = size_to_class(cache_size) {
+                    let block_ptr = size_ptr as *mut u8;
+
+                    // Try local free magazine
+                    if cache.free_mags[class].push(block_ptr) {
+                        cache.metrics.frees += 1;
+                        cache.metrics.maybe_flush();
+                        return;
+                    }
+
+                    // Magazine full - push to global pool
+                    let node_layout = Layout::new::<MagazineNode>();
+                    let node = alloc::alloc::alloc(node_layout) as *mut MagazineNode;
+
+                    if !node.is_null() {
+                        core::ptr::write(
+                            node,
+                            MagazineNode {
+                                magazine: core::mem::take(&mut cache.free_mags[class]),
+                                next: core::ptr::null_mut(),
+                            },
+                        );
+                        GLOBAL_MAGAZINES.get(class).push(node);
+                    }
+
+                    // Push to now-empty magazine
+                    let _ = cache.free_mags[class].push(block_ptr);
+                    cache.metrics.frees += 1;
+                    cache.metrics.maybe_flush();
+                    return;
+                }
+            }
+        }
+
         let header = Self::page_header_from_ptr(ptr);
         let header_ref = core::ptr::read(header);
 
@@ -353,14 +554,12 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
     }
 }
 
-/// Flush current thread's metrics to global counters
 #[no_mangle]
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn aethalloc_get_metrics() -> MetricsSnapshot {
     GLOBAL_METRICS.snapshot()
 }
 
-/// Force flush current thread's pending metrics
 #[allow(dead_code)]
 pub unsafe fn flush_thread_metrics() {
     let cache = get_thread_cache();
