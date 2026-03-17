@@ -1,6 +1,6 @@
 //! Benchmarks for SPSC ring buffer push/pop latency
 
-use aethalloc_amo::{ring_buffer::RingEntry, RingBuffer, RingCommand, RingPayload};
+use aethalloc_amo::{RingBuffer, RingEntry};
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
 fn bench_push_pop(c: &mut Criterion) {
@@ -10,17 +10,14 @@ fn bench_push_pop(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(1));
 
+    let entry = RingEntry::default();
+
     // Benchmark push alone
     group.bench_function("try_push", |b| {
         let rb: RingBuffer<CAPACITY> = RingBuffer::new();
-        let entry = RingEntry {
-            command: RingCommand::NoOp,
-            payload: RingPayload::default(),
-        };
 
         b.iter(|| {
-            // Push and pop to keep buffer from filling
-            black_box(rb.try_push(entry.clone()));
+            black_box(rb.try_push(entry));
             black_box(rb.try_pop());
         });
     });
@@ -28,20 +25,16 @@ fn bench_push_pop(c: &mut Criterion) {
     // Benchmark pop alone (with pre-filled buffer)
     group.bench_function("try_pop", |b| {
         let rb: RingBuffer<CAPACITY> = RingBuffer::new();
-        let entry = RingEntry {
-            command: RingCommand::NoOp,
-            payload: RingPayload::default(),
-        };
 
         // Pre-fill half the buffer
         for _ in 0..CAPACITY / 2 {
-            rb.try_push(entry.clone()).unwrap();
+            rb.try_push(entry).unwrap();
         }
 
         b.iter(|| {
             let result = black_box(rb.try_pop());
             if result.is_some() {
-                black_box(rb.try_push(entry.clone()));
+                black_box(rb.try_push(entry));
             }
             result
         });
@@ -50,13 +43,9 @@ fn bench_push_pop(c: &mut Criterion) {
     // Benchmark combined push + pop
     group.bench_function("push_pop_roundtrip", |b| {
         let rb: RingBuffer<CAPACITY> = RingBuffer::new();
-        let entry = RingEntry {
-            command: RingCommand::NoOp,
-            payload: RingPayload::default(),
-        };
 
         b.iter(|| {
-            black_box(rb.try_push(entry.clone()));
+            black_box(rb.try_push(entry));
             black_box(rb.try_pop())
         });
     });
