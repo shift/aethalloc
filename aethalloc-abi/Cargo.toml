@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 default = ["simple-cache"]
 magazine-caching = ["aethalloc-core/magazine"]
 simple-cache = []
+metrics = []
 
 [dependencies]
 aethalloc-core = { path = "../aethalloc-core" }

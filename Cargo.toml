@@ -2,10 +2,8 @@
 resolver = "2"
 members = [
     "aethalloc-core",
-    "aethalloc-amo",
-    "aethalloc-vmpc",
-    "aethalloc-hess",
     "aethalloc-abi",
+    "aethalloc-metrics",
 ]
 
 [workspace.package]

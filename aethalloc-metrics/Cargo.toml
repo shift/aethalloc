@@ -1,0 +1,16 @@
+[package]
+name = "aethalloc-metrics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "aethalloc-metrics"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+
+[features]
+default = []
