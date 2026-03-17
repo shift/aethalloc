@@ -12,8 +12,8 @@ use aethalloc_core::size_class::round_up_pow2;
 
 const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
-const MAX_CACHE_SIZE: usize = 8192;
-const NUM_SIZE_CLASSES: usize = 10;
+const MAX_CACHE_SIZE: usize = 65536;
+const NUM_SIZE_CLASSES: usize = 14;
 
 const MAGIC: u32 = 0xA7E8A110;
 
@@ -64,6 +64,9 @@ impl ThreadCache {
             2048 => Some(7),
             4096 => Some(8),
             8192 => Some(9),
+            16384 => Some(10),
+            32768 => Some(11),
+            65536 => Some(12),
             _ => None,
         }
     }
