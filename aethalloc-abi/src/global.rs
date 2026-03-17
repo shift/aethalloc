@@ -14,7 +14,6 @@ const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const MAX_CACHE_SIZE: usize = 8192;
 const NUM_SIZE_CLASSES: usize = 10;
-const CACHE_CAPACITY: usize = 256;
 
 const MAGIC: u32 = 0xA7E8A110;
 
@@ -129,10 +128,30 @@ unsafe impl GlobalAlloc for AethAlloc {
 
                 CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
-                // Allocate new block
-                let alloc_size = cache_size + CACHE_HEADER_SIZE;
-                let pages = alloc_size.div_ceil(PAGE_SIZE).max(1);
+                // Batch-allocate: carve one page into multiple blocks
+                let block_size = cache_size + CACHE_HEADER_SIZE;
+                let blocks_per_page = PAGE_SIZE / block_size;
 
+                if blocks_per_page > 1 {
+                    if let Some(base) = PageAllocator::alloc(1) {
+                        let base_ptr = base.as_ptr();
+
+                        // Add all blocks except first to free list
+                        for i in 1..blocks_per_page {
+                            let block_ptr = base_ptr.add(i * block_size);
+                            core::ptr::write(block_ptr as *mut *mut u8, cache.heads[class]);
+                            cache.heads[class] = block_ptr;
+                            cache.counts[class] += 1;
+                        }
+
+                        // Return first block
+                        core::ptr::write(base_ptr as *mut usize, size);
+                        return base_ptr.add(CACHE_HEADER_SIZE);
+                    }
+                }
+
+                // Fallback for large blocks that don't fit well in a page
+                let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
                     let size_ptr = base.as_ptr() as *mut usize;
                     core::ptr::write(size_ptr, size);
@@ -181,23 +200,13 @@ unsafe impl GlobalAlloc for AethAlloc {
                 let cache = get_thread_cache();
                 let cache_size = round_up_pow2(maybe_size).max(16);
 
-                if let Some(class) = ThreadCache::size_to_class(cache_size) {
-                    if cache.counts[class] < CACHE_CAPACITY {
-                        // Push to free list
-                        let head_ptr = size_ptr as *mut *mut u8;
-                        core::ptr::write(head_ptr, cache.heads[class]);
-                        cache.heads[class] = size_ptr as *mut u8;
-                        cache.counts[class] += 1;
-                        return;
-                    }
+                if let Some(_class) = ThreadCache::size_to_class(cache_size) {
+                    let head_ptr = size_ptr as *mut *mut u8;
+                    core::ptr::write(head_ptr, cache.heads[_class]);
+                    cache.heads[_class] = size_ptr as *mut u8;
+                    cache.counts[_class] += 1;
+                    return;
                 }
-
-                // Cache full - free directly
-                let alloc_size = cache_size + CACHE_HEADER_SIZE;
-                let pages = alloc_size.div_ceil(PAGE_SIZE).max(1);
-                let base = NonNull::new_unchecked(size_ptr as *mut u8);
-                PageAllocator::dealloc(base, pages);
-                return;
             }
         }
 
