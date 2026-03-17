@@ -2,6 +2,7 @@
 
 #![feature(thread_local)]
 #![cfg_attr(not(test), no_std)]
+#![allow(static_mut_refs)]
 #![allow(unknown_lints)]
 
 extern crate alloc;
