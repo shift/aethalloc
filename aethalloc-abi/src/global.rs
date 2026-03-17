@@ -12,7 +12,7 @@ use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
 
 #[cfg(feature = "magazine-caching")]
-use aethalloc_core::magazine::{GlobalMagazinePools, Magazine, MagazineNode};
+use aethalloc_core::magazine::{GlobalMagazinePools, Magazine, MetadataAllocator};
 
 const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
@@ -36,6 +36,9 @@ pub static GLOBAL_METRICS: GlobalMetrics = GlobalMetrics::new();
 
 #[cfg(feature = "magazine-caching")]
 pub static GLOBAL_MAGAZINES: GlobalMagazinePools = GlobalMagazinePools::new();
+
+#[cfg(feature = "magazine-caching")]
+pub static METADATA_ALLOCATOR: MetadataAllocator = MetadataAllocator::new();
 
 pub struct GlobalMetrics {
     pub allocs: AtomicU64,
@@ -396,11 +399,11 @@ unsafe impl GlobalAlloc for AethAlloc {
                 }
 
                 // Try to get a full magazine from global pool
-                if let Some(node_ptr) = GLOBAL_MAGAZINES.get(class).pop() {
+                if let Some(node_ptr) = GLOBAL_MAGAZINES.get(class).pop_full() {
                     let node = &mut *node_ptr;
                     core::mem::swap(&mut cache.alloc_mags[class], &mut node.magazine);
                     node.magazine.clear();
-                    GLOBAL_MAGAZINES.get(class).push(node_ptr);
+                    GLOBAL_MAGAZINES.get(class).push_empty(node_ptr);
 
                     if let Some(block) = cache.alloc_mags[class].pop() {
                         cache.metrics.cache_hits += 1;
@@ -491,19 +494,13 @@ unsafe impl GlobalAlloc for AethAlloc {
                         return;
                     }
 
-                    // Magazine full - push to global pool
-                    let node_layout = Layout::new::<MagazineNode>();
-                    let node = alloc::alloc::alloc(node_layout) as *mut MagazineNode;
+                    // Magazine full - push to global pool using metadata allocator
+                    let node = METADATA_ALLOCATOR.alloc_node();
 
                     if !node.is_null() {
-                        core::ptr::write(
-                            node,
-                            MagazineNode {
-                                magazine: core::mem::take(&mut cache.free_mags[class]),
-                                next: core::ptr::null_mut(),
-                            },
-                        );
-                        GLOBAL_MAGAZINES.get(class).push(node);
+                        (*node).magazine = core::mem::take(&mut cache.free_mags[class]);
+                        (*node).next = core::ptr::null_mut();
+                        GLOBAL_MAGAZINES.get(class).push_full(node);
                     }
 
                     // Push to now-empty magazine

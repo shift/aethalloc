@@ -23,4 +23,7 @@ pub mod slab;
 pub mod thread_local;
 
 pub use global_pool::GlobalPools;
-pub use magazine::{GlobalMagazinePools, Magazine, MAGAZINE_CAPACITY, NUM_SIZE_CLASSES};
+pub use magazine::{
+    GlobalMagazinePools, Magazine, MagazineNode, MetadataAllocator, MAGAZINE_CAPACITY,
+    NUM_SIZE_CLASSES,
+};

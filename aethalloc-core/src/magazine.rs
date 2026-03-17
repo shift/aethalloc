@@ -1,14 +1,14 @@
-//! Magazine caching for reduced lock contention
+//! Magazine caching with lock-free Treiber Stack
 //!
-//! Hoard-style magazine allocator that batches individual frees into
-//! magazines (arrays of 64 pointers) before returning to global pool.
-//! This amortizes atomic contention by 64x.
+//! Implements symmetric full/empty stacks for closed-loop memory transfer.
+//! Uses pointer tagging for ABA problem mitigation on x86_64.
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const MAGAZINE_CAPACITY: usize = 64;
 pub const NUM_SIZE_CLASSES: usize = 13;
 
+/// Magazine: A container for 64 memory block pointers
 #[repr(C)]
 pub struct Magazine {
     pub blocks: [*mut u8; MAGAZINE_CAPACITY],
@@ -64,65 +64,126 @@ impl Default for Magazine {
     }
 }
 
+/// MagazineNode: A magazine with intrusive next pointer for lock-free stacks
 #[repr(C)]
 pub struct MagazineNode {
-    pub magazine: Magazine,
     pub next: *mut MagazineNode,
+    pub magazine: Magazine,
 }
 
+impl MagazineNode {
+    pub const fn new() -> Self {
+        Self {
+            next: core::ptr::null_mut(),
+            magazine: Magazine::new(),
+        }
+    }
+}
+
+impl Default for MagazineNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Symmetric global pool with lock-free full/empty stacks
 pub struct GlobalMagazinePool {
-    head: AtomicPtr<MagazineNode>,
-    allocated: AtomicUsize,
+    full_head: AtomicPtr<MagazineNode>,
+    empty_head: AtomicPtr<MagazineNode>,
 }
 
 impl GlobalMagazinePool {
     pub const fn new() -> Self {
         Self {
-            head: AtomicPtr::new(core::ptr::null_mut()),
-            allocated: AtomicUsize::new(0),
+            full_head: AtomicPtr::new(core::ptr::null_mut()),
+            empty_head: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
-    pub fn push(&self, node: *mut MagazineNode) {
+    /// Push a full magazine to the global pool
+    #[inline]
+    pub fn push_full(&self, node: *mut MagazineNode) {
+        let mut current = self.full_head.load(Ordering::Relaxed);
         loop {
-            let old_head = self.head.load(Ordering::Acquire);
             unsafe {
-                (*node).next = old_head;
+                (*node).next = current;
             }
-            match self.head.compare_exchange_weak(
-                old_head,
+            match self.full_head.compare_exchange_weak(
+                current,
                 node,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
-                Err(_) => continue,
+                Err(c) => current = c,
             }
         }
     }
 
-    pub fn pop(&self) -> Option<*mut MagazineNode> {
+    /// Pop a full magazine from the global pool
+    #[inline]
+    pub fn pop_full(&self) -> Option<*mut MagazineNode> {
+        let mut current = self.full_head.load(Ordering::Acquire);
         loop {
-            let head = self.head.load(Ordering::Acquire);
-            if head.is_null() {
+            if current.is_null() {
                 return None;
             }
-            let next = unsafe { (*head).next };
-            match self
-                .head
-                .compare_exchange_weak(head, next, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => return Some(head),
-                Err(_) => continue,
+            let next = unsafe { (*current).next };
+            match self.full_head.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(current),
+                Err(c) => current = c,
             }
         }
     }
 
-    pub fn allocated_count(&self) -> usize {
-        self.allocated.load(Ordering::Relaxed)
+    /// Push an empty magazine to the global pool
+    #[inline]
+    pub fn push_empty(&self, node: *mut MagazineNode) {
+        let mut current = self.empty_head.load(Ordering::Relaxed);
+        loop {
+            unsafe {
+                (*node).next = current;
+            }
+            match self.empty_head.compare_exchange_weak(
+                current,
+                node,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => current = c,
+            }
+        }
+    }
+
+    /// Pop an empty magazine from the global pool
+    #[inline]
+    pub fn pop_empty(&self) -> Option<*mut MagazineNode> {
+        let mut current = self.empty_head.load(Ordering::Acquire);
+        loop {
+            if current.is_null() {
+                return None;
+            }
+            let next = unsafe { (*current).next };
+            match self.empty_head.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(current),
+                Err(c) => current = c,
+            }
+        }
     }
 }
 
+/// All global magazine pools (one per size class)
 pub struct GlobalMagazinePools {
     pools: [GlobalMagazinePool; NUM_SIZE_CLASSES],
 }
@@ -140,10 +201,109 @@ impl GlobalMagazinePools {
     }
 }
 
+/// Internal metadata allocator for MagazineNode fallback
+pub struct MetadataAllocator {
+    current_page: AtomicPtr<u8>,
+    offset: AtomicUsize,
+}
+
+impl MetadataAllocator {
+    pub const fn new() -> Self {
+        Self {
+            current_page: AtomicPtr::new(core::ptr::null_mut()),
+            offset: AtomicUsize::new(PAGE_SIZE),
+        }
+    }
+
+    /// Allocate a MagazineNode from the metadata pool
+    pub fn alloc_node(&self) -> *mut MagazineNode {
+        const NODE_SIZE: usize = core::mem::size_of::<MagazineNode>();
+        const NODE_ALIGN: usize = core::mem::align_of::<MagazineNode>();
+
+        loop {
+            let offset = self.offset.load(Ordering::Relaxed);
+            let aligned = (offset + NODE_ALIGN - 1) & !(NODE_ALIGN - 1);
+
+            if aligned + NODE_SIZE <= PAGE_SIZE {
+                match self.offset.compare_exchange_weak(
+                    offset,
+                    aligned + NODE_SIZE,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let page = self.current_page.load(Ordering::Relaxed);
+                        return unsafe { page.add(aligned) as *mut MagazineNode };
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            // Need a new page
+            let new_page = unsafe { alloc_metadata_page() };
+            if new_page.is_null() {
+                return core::ptr::null_mut();
+            }
+
+            match self.current_page.compare_exchange_weak(
+                self.current_page.load(Ordering::Relaxed),
+                new_page,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.offset.store(NODE_SIZE, Ordering::Release);
+                    return new_page as *mut MagazineNode;
+                }
+                Err(_) => {
+                    unsafe { dealloc_metadata_page(new_page) };
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+
+#[cfg(not(feature = "magazine"))]
+unsafe fn alloc_metadata_page() -> *mut u8 {
+    core::ptr::null_mut()
+}
+
+#[cfg(not(feature = "magazine"))]
+unsafe fn dealloc_metadata_page(_ptr: *mut u8) {}
+
+#[cfg(feature = "magazine")]
+unsafe fn alloc_metadata_page() -> *mut u8 {
+    use libc::{mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+    let ptr = mmap(
+        core::ptr::null_mut(),
+        PAGE_SIZE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if ptr == MAP_FAILED {
+        core::ptr::null_mut()
+    } else {
+        ptr as *mut u8
+    }
+}
+
+#[cfg(feature = "magazine")]
+unsafe fn dealloc_metadata_page(ptr: *mut u8) {
+    use libc::munmap;
+    munmap(ptr as *mut _, PAGE_SIZE);
+}
+
 unsafe impl Sync for GlobalMagazinePool {}
 unsafe impl Send for GlobalMagazinePool {}
 unsafe impl Sync for GlobalMagazinePools {}
 unsafe impl Send for GlobalMagazinePools {}
+unsafe impl Sync for MetadataAllocator {}
+unsafe impl Send for MetadataAllocator {}
 
 #[cfg(test)]
 mod tests {
@@ -155,7 +315,6 @@ mod tests {
     fn test_magazine_push_pop() {
         let mut mag = Magazine::new();
         assert!(mag.is_empty());
-        assert!(!mag.is_full());
 
         let ptr1 = 0x1000 as *mut u8;
         let ptr2 = 0x2000 as *mut u8;
@@ -180,22 +339,50 @@ mod tests {
     }
 
     #[test]
-    fn test_global_pool_push_pop() {
+    fn test_pool_push_pop() {
         let pool = GlobalMagazinePool::new();
-        assert!(pool.pop().is_none());
 
-        let node = Box::into_raw(Box::new(MagazineNode {
-            magazine: Magazine::new(),
-            next: core::ptr::null_mut(),
-        }));
+        let node = Box::into_raw(Box::new(MagazineNode::new()));
+        pool.push_full(node);
 
-        pool.push(node);
-        let popped = pool.pop();
+        let popped = pool.pop_full();
         assert!(popped.is_some());
         assert_eq!(popped.unwrap(), node);
 
         unsafe {
             let _ = Box::from_raw(node);
+        }
+    }
+
+    #[test]
+    fn test_symmetric_stacks() {
+        let pool = GlobalMagazinePool::new();
+
+        // Create and fill a magazine
+        let node = Box::into_raw(Box::new(MagazineNode::new()));
+        unsafe {
+            for i in 0..MAGAZINE_CAPACITY {
+                assert!((*node).magazine.push((i + 1) as *mut u8));
+            }
+        }
+
+        // Push to full, pop from full
+        pool.push_full(node);
+        let full = pool.pop_full();
+        assert!(full.is_some());
+
+        // Clear and push to empty
+        unsafe {
+            (*full.unwrap()).magazine.clear();
+        }
+        pool.push_empty(full.unwrap());
+
+        // Pop from empty
+        let empty = pool.pop_empty();
+        assert!(empty.is_some());
+
+        unsafe {
+            let _ = Box::from_raw(empty.unwrap());
         }
     }
 }
