@@ -6,7 +6,7 @@
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
@@ -19,6 +19,8 @@ const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const MAX_CACHE_SIZE: usize = 65536;
 const NUM_SIZE_CLASSES: usize = 14;
 const METRICS_FLUSH_THRESHOLD: usize = 4096;
+const MAX_FREE_LIST_LENGTH: usize = 4096;
+const GLOBAL_FREE_BATCH: usize = 128;
 
 const MAGIC: u32 = 0xA7E8A110;
 
@@ -31,6 +33,98 @@ struct PageHeader {
 
 const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
 const CACHE_HEADER_SIZE: usize = core::mem::size_of::<usize>();
+
+#[cfg(not(feature = "magazine-caching"))]
+struct GlobalFreeList {
+    head: AtomicPtr<u8>,
+}
+
+#[cfg(not(feature = "magazine-caching"))]
+impl GlobalFreeList {
+    const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    #[inline]
+    unsafe fn push(&self, block: *mut u8) {
+        let mut current = self.head.load(Ordering::Relaxed);
+        loop {
+            core::ptr::write(block as *mut *mut u8, current);
+            match self.head.compare_exchange_weak(
+                current,
+                block,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn pop(&self) -> Option<*mut u8> {
+        let mut current = self.head.load(Ordering::Relaxed);
+        loop {
+            if current.is_null() {
+                return None;
+            }
+            let next = core::ptr::read(current as *mut *mut u8);
+            match self.head.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn pop_batch(
+        &self,
+        count: usize,
+        heads: &mut [*mut u8; NUM_SIZE_CLASSES],
+        counts: &mut [usize; NUM_SIZE_CLASSES],
+        class: usize,
+    ) -> usize {
+        let mut transferred = 0;
+        while transferred < count {
+            match self.pop() {
+                Some(block) => {
+                    core::ptr::write(block as *mut *mut u8, heads[class]);
+                    heads[class] = block;
+                    counts[class] += 1;
+                    transferred += 1;
+                }
+                None => break,
+            }
+        }
+        transferred
+    }
+}
+
+#[cfg(not(feature = "magazine-caching"))]
+static GLOBAL_FREE_LISTS: [GlobalFreeList; NUM_SIZE_CLASSES] = [
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+    GlobalFreeList::new(),
+];
 
 pub static GLOBAL_METRICS: GlobalMetrics = GlobalMetrics::new();
 
@@ -273,6 +367,31 @@ unsafe impl GlobalAlloc for AethAlloc {
                     return head.add(CACHE_HEADER_SIZE);
                 }
 
+                // Try global free list before allocating new pages (only if non-empty)
+                if !GLOBAL_FREE_LISTS[class]
+                    .head
+                    .load(Ordering::Relaxed)
+                    .is_null()
+                {
+                    let transferred = GLOBAL_FREE_LISTS[class].pop_batch(
+                        GLOBAL_FREE_BATCH,
+                        &mut cache.heads,
+                        &mut cache.counts,
+                        class,
+                    );
+                    if transferred > 0 {
+                        let block = cache.heads[class];
+                        let next = core::ptr::read(block as *mut *mut u8);
+                        cache.heads[class] = next;
+                        cache.counts[class] -= 1;
+                        cache.metrics.cache_hits += 1;
+                        cache.metrics.allocs += 1;
+                        cache.metrics.maybe_flush();
+                        core::ptr::write(block as *mut usize, size);
+                        return block.add(CACHE_HEADER_SIZE);
+                    }
+                }
+
                 cache.metrics.cache_misses += 1;
                 cache.metrics.allocs += 1;
 
@@ -351,6 +470,21 @@ unsafe impl GlobalAlloc for AethAlloc {
                     cache.counts[class] += 1;
                     cache.metrics.frees += 1;
                     cache.metrics.maybe_flush();
+
+                    // Anti-hoarding: flush excess to global free list
+                    if cache.counts[class] >= MAX_FREE_LIST_LENGTH {
+                        let flush_count = cache.counts[class] / 2;
+                        for _ in 0..flush_count {
+                            let block = cache.heads[class];
+                            if block.is_null() {
+                                break;
+                            }
+                            let next = core::ptr::read(block as *mut *mut u8);
+                            cache.heads[class] = next;
+                            cache.counts[class] -= 1;
+                            GLOBAL_FREE_LISTS[class].push(block);
+                        }
+                    }
                     return;
                 }
             }
