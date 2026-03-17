@@ -1,0 +1,1 @@
+//! CHERI capability hardware support

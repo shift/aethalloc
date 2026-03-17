@@ -1,0 +1,15 @@
+[package]
+name = "aethalloc-hess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+aethalloc-mte = []
+aethalloc-cheri = []
+
+[dependencies]

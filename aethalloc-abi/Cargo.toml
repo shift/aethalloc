@@ -1,0 +1,12 @@
+[package]
+name = "aethalloc-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aethalloc-core = { path = "../aethalloc-core" }
+libc = { version = "0.2", default-features = false }

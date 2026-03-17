@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "aethalloc-core",
+    "aethalloc-amo",
+    "aethalloc-vmpc",
+    "aethalloc-hess",
+    "aethalloc-abi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anomalyco/aethalloc"
+authors = ["AethAlloc Team"]
+
+[workspace.dependencies]
+aethalloc-core = { path = "aethalloc-core" }
+aethalloc-amo = { path = "aethalloc-amo" }
+aethalloc-vmpc = { path = "aethalloc-vmpc" }
+aethalloc-hess = { path = "aethalloc-hess" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "thin"

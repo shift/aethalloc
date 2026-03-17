@@ -1,0 +1,16 @@
+agents:
+  planner:
+    agent_type: architecture
+    description: Handles system design, planning, and architectural decisions
+  coder:
+    agent_type: implementation
+    description: Handles code changes and technical implementation tasks
+  reviewer:
+    agent_type: quality_assurance
+    description: Reviews code for quality and standards compliance
+workspaces:
+  default:
+    agents:
+    - coder
+    - reviewer
+    sync_strategy: merge_with_conflict_resolution

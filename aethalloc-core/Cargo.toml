@@ -1,0 +1,20 @@
+[package]
+name = "aethalloc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["size-class", "page", "slab", "buddy", "thread-local"]
+size-class = []
+page = []
+slab = []
+buddy = []
+thread-local = []
+aethalloc-audit = []
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
