@@ -7,4 +7,12 @@ license.workspace = true
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = []
+std = []
+
 [dependencies]
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"
