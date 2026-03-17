@@ -127,6 +127,7 @@ Use `magazine-caching` for:
 
 ## Benchmarks
 
+**Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz  
 **Last updated:** 2026-03-17
 
 ### Summary
@@ -135,10 +136,12 @@ AethAlloc achieves parity or better with glibc in key workloads while using sign
 
 | Benchmark | glibc | AethAlloc | Ratio | Winner |
 |-----------|-------|-----------|-------|--------|
-| Packet Churn | 186K ops/s | 198K ops/s | 106% | AethAlloc |
-| KV Store | 260K ops/s | 257K ops/s | 99% | Tie |
+| Packet Churn | 225K ops/s | 272K ops/s | 121% | AethAlloc |
+| KV Store | 337K ops/s | 369K ops/s | 109% | AethAlloc |
+| Producer-Consumer | 543K ops/s | 724K ops/s | 133% | AethAlloc |
+| Multithread (8T) | 10.6M ops/s | 9.6M ops/s | 91% | glibc |
 | Fragmentation | 246K ops/s | 141K ops/s | 57% | glibc |
-| Multithread (8T) | 7.9M ops/s | 6.7M ops/s | 85% | glibc |
+| Fragmentation RSS | 219 MB | 19 MB | 11x better | AethAlloc |
 
 ### Packet Churn (Network Processing)
 
@@ -178,6 +181,14 @@ Concurrent allocations (16B - 4KB) across 8 threads.
 | Metric | glibc | AethAlloc | Delta |
 |--------|-------|-----------|-------|
 | Throughput | 7.88M ops/s | 6.73M ops/s | -15% |
+
+### Producer-Consumer (Cross-Thread Frees)
+
+Thread A allocates, Thread B frees. Simulates network packet processing.
+
+| Metric | glibc | AethAlloc (simple-cache) |
+|--------|-------|---------------------------|
+| Throughput | 543K ops/s | 724K ops/s (+33%) |
 | Avg latency | 690 ns | 754 ns | +9% |
 
 ### Single-Thread Cache
