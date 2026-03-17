@@ -7,6 +7,8 @@
 
 pub mod command;
 pub mod ring_buffer;
+#[cfg(feature = "std")]
+pub mod support_core;
 
 pub use command::{RingCommand, RingEntry, RingPayload};
 pub use ring_buffer::RingBuffer;

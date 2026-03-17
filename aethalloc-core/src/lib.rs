@@ -15,7 +15,10 @@ extern crate libc;
 extern crate std;
 
 pub mod buddy;
+pub mod global_pool;
 pub mod page;
 pub mod size_class;
 pub mod slab;
 pub mod thread_local;
+
+pub use global_pool::GlobalPools;

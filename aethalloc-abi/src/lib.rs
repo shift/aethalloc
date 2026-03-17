@@ -1,8 +1,11 @@
 //! AethAlloc ABI - C-compatible allocator interface for LD_PRELOAD injection
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -98,6 +101,7 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut u8 {
     }
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

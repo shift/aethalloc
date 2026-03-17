@@ -7,9 +7,9 @@ pub enum RingCommand {
     /// Return block to global pool
     FreeBlock = 0,
     /// Trigger VMPC on a memory region
-    CompactionRequest = 1,
+    CompactionRequest = 2,
     /// Update MTE tag
-    TagUpdate = 2,
+    TagUpdate = 4,
     /// Telemetry from application thread
     StatsReport = 3,
     /// No operation (padding/empty)
@@ -118,6 +118,6 @@ impl Clone for RingPayload {
 
 impl Copy for RingPayload {}
 
-// Verify size and alignment at compile time
 const _: () = assert!(core::mem::size_of::<RingEntry>() == 64);
 const _: () = assert!(core::mem::align_of::<RingEntry>() == 64);
+const _: () = assert!(core::mem::size_of::<RingPayload>() == 56);
