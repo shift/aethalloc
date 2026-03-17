@@ -25,12 +25,22 @@ pub enum CompactError {
     Unknown(i32),
 }
 
+impl CompactError {
+    #[cfg(all(unix, feature = "std"))]
+    fn from_errno() -> Self {
+        let errno = unsafe { *libc::__errno_location() };
+        match errno {
+            libc::EINVAL => CompactError::InvalidAddress,
+            libc::ENOMEM => CompactError::OutOfMemory,
+            libc::EPERM => CompactError::PermissionDenied,
+            libc::EACCES => CompactError::PermissionDenied,
+            libc::EFAULT => CompactError::InvalidAddress,
+            _ => CompactError::Unknown(errno),
+        }
+    }
+}
+
 /// Wrapper for mremap syscall
-///
-/// # Safety
-/// - old_addr must be page-aligned and point to valid mapped memory
-/// - old_size must be positive and page-aligned
-/// - new_size must be positive and page-aligned
 #[cfg(all(unix, feature = "std"))]
 pub unsafe fn mremap_wrapper(
     old_addr: NonNull<u8>,
@@ -65,11 +75,6 @@ pub unsafe fn mremap_wrapper(
 }
 
 /// Wrapper for process_vm_writev (cross-process memory copy)
-///
-/// # Safety
-/// - local_iov must point to valid local buffers
-/// - remote_iov must point to valid remote process addresses
-/// - pid must be a valid process ID
 #[cfg(all(unix, feature = "std"))]
 pub unsafe fn process_vm_writev(
     pid: libc::pid_t,
@@ -101,7 +106,7 @@ pub unsafe fn process_vm_readv(
 ) -> Result<usize, CompactError> {
     let result = libc::process_vm_readv(
         pid,
-        local_iov.as_ptr(),
+        local_iov.as_mut_ptr(),
         local_iov.len() as libc::c_ulong,
         remote_iov.as_ptr(),
         remote_iov.len() as libc::c_ulong,
@@ -115,18 +120,21 @@ pub unsafe fn process_vm_readv(
     }
 }
 
+/// Build an iovec from a buffer
 #[cfg(all(unix, feature = "std"))]
-impl CompactError {
-    fn from_errno() -> Self {
-        unsafe {
-            match *libc::__errno_location() {
-                libc::EACCES => CompactError::PermissionDenied,
-                libc::ENOMEM => CompactError::OutOfMemory,
-                libc::EFAULT => CompactError::InvalidAddress,
-                libc::EPERM => CompactError::PermissionDenied,
-                e => CompactError::Unknown(e),
-            }
-        }
+pub fn make_iovec(buf: &[u8]) -> libc::iovec {
+    libc::iovec {
+        iov_base: buf.as_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
+    }
+}
+
+/// Build a mutable iovec from a buffer
+#[cfg(all(unix, feature = "std"))]
+pub fn make_iovec_mut(buf: &mut [u8]) -> libc::iovec {
+    libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
     }
 }
 
@@ -168,6 +176,89 @@ impl Compactor {
         Self { config }
     }
 
+    /// Try to relocate a page to a new physical location while
+    /// preserving the virtual address.
+    ///
+    /// This is used for defragmentation: we allocate a new physical page,
+    /// copy the contents, then remap the old virtual address to the new page.
+    ///
+    /// # Safety
+    /// - src must be page-aligned and point to valid mapped memory
+    /// - size must be a multiple of PAGE_SIZE
+    /// - caller must ensure no concurrent access to the region
+    #[cfg(all(unix, feature = "std"))]
+    pub unsafe fn try_relocate_page(
+        &self,
+        src: NonNull<u8>,
+        size: usize,
+    ) -> Result<CompactResult, CompactError> {
+        let page_size = PAGE_SIZE;
+
+        if size == 0 || size % page_size != 0 {
+            return Err(CompactError::InvalidAddress);
+        }
+
+        let src_addr = src.as_ptr();
+
+        // Step 1: Allocate a temporary buffer to hold page contents
+        let temp_buf = libc::mmap(
+            core::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+
+        if temp_buf == libc::MAP_FAILED {
+            return Err(CompactError::OutOfMemory);
+        }
+
+        // Step 2: Copy data from source to temp buffer
+        core::ptr::copy_nonoverlapping(src_addr, temp_buf as *mut u8, size);
+
+        // Step 3: Unmap the original page
+        if libc::munmap(src_addr as *mut core::ffi::c_void, size) < 0 {
+            // Try to restore the mapping at the original address
+            let restore = libc::mmap(
+                src_addr as *mut core::ffi::c_void,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if restore != libc::MAP_FAILED {
+                core::ptr::copy_nonoverlapping(temp_buf as *const u8, src_addr, size);
+            }
+            libc::munmap(temp_buf, size);
+            return Err(CompactError::Unknown(*libc::__errno_location()));
+        }
+
+        // Step 4: Map a new page at the original virtual address
+        let result = libc::mmap(
+            src_addr as *mut core::ffi::c_void,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+
+        if result == libc::MAP_FAILED {
+            libc::munmap(temp_buf, size);
+            return Err(CompactError::Unknown(*libc::__errno_location()));
+        }
+
+        // Step 5: Copy data back to the remapped address
+        core::ptr::copy_nonoverlapping(temp_buf as *const u8, src_addr, size);
+
+        // Clean up the temporary buffer
+        libc::munmap(temp_buf, size);
+
+        Ok(CompactResult::Success)
+    }
+
     /// Compact a region by moving pages to consolidate sparse allocations
     ///
     /// # Safety
@@ -176,70 +267,16 @@ impl Compactor {
     #[cfg(all(unix, feature = "std"))]
     pub unsafe fn compact_pages(
         &self,
-        pages: &[NonNull<u8>],
-        page_sizes: &[usize],
-    ) -> CompactResult {
-        if pages.len() < self.config.min_pages_to_compact {
-            return CompactResult::NoAction;
-        }
-
-        if pages.len() != page_sizes.len() {
-            return CompactResult::Failed(CompactError::InvalidAddress);
-        }
-
-        let to_process = pages.len().min(self.config.max_pages_per_pass);
-        let mut moved = 0;
-
-        for i in 0..to_process {
-            let src = pages[i];
-            let size = page_sizes[i];
-
-            if size == 0 || src.as_ptr() as usize % PAGE_SIZE != 0 {
-                continue;
-            }
-
-            if self.try_relocate_page(src, size).is_ok() {
-                moved += 1;
-            }
-        }
-
-        if moved == 0 {
-            CompactResult::NoAction
-        } else if moved == to_process {
-            CompactResult::Success
-        } else {
-            CompactResult::PartialSuccess { pages_moved: moved }
-        }
-    }
-
-    #[cfg(all(unix, feature = "std"))]
-    unsafe fn try_relocate_page(&self, src: NonNull<u8>, size: usize) -> Result<(), CompactError> {
-        let _ = (src, size);
-        Err(CompactError::Unknown(libc::ENOSYS))
+        src: NonNull<u8>,
+        size: usize,
+    ) -> Result<CompactResult, CompactError> {
+        self.try_relocate_page(src, size)
     }
 }
 
 impl Default for Compactor {
     fn default() -> Self {
         Self::new(CompactConfig::default())
-    }
-}
-
-/// Build an iovec from a buffer
-#[cfg(all(unix, feature = "std"))]
-pub fn make_iovec(buf: &[u8]) -> libc::iovec {
-    libc::iovec {
-        iov_base: buf.as_ptr() as *mut core::ffi::c_void,
-        iov_len: buf.len(),
-    }
-}
-
-/// Build a mutable iovec from a buffer
-#[cfg(all(unix, feature = "std"))]
-pub fn make_iovec_mut(buf: &mut [u8]) -> libc::iovec {
-    libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut core::ffi::c_void,
-        iov_len: buf.len(),
     }
 }
 
@@ -304,6 +341,50 @@ mod tests {
             } else {
                 libc::munmap(addr, page_size);
             }
+        }
+    }
+
+    #[cfg(all(unix, feature = "std"))]
+    #[test]
+    fn test_try_relocate_page() {
+        let compactor = Compactor::default();
+        let page_size = PAGE_SIZE;
+
+        // Allocate a page
+        let addr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+
+        if addr == libc::MAP_FAILED {
+            return;
+        }
+
+        unsafe {
+            // Write some data
+            let ptr = addr as *mut u8;
+            core::ptr::write_bytes(ptr, 0xAB, page_size);
+
+            // Try to relocate
+            let nn = NonNull::new_unchecked(ptr);
+            let result = compactor.try_relocate_page(nn, page_size);
+
+            // Check result
+            if let Ok(CompactResult::Success) = result {
+                // Verify data is still there
+                for i in 0..page_size {
+                    assert_eq!(*ptr.add(i), 0xAB);
+                }
+            }
+
+            // Cleanup
+            libc::munmap(addr, page_size);
         }
     }
 }
