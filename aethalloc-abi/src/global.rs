@@ -1,24 +1,29 @@
 //! Global allocator implementation with size tracking
 //!
 //! This allocator stores a header before each allocation containing the size.
-//! This allows proper dealloc and realloc implementation.
+//! The header is placed immediately before the aligned user pointer, ensuring
+//! proper alignment for all allocation requests.
+//!
+//! TODO: Integrate ThreadLocalCache for small allocations (requires TLS support in no_std)
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 
 use aethalloc_core::page::PageAllocator;
-use aethalloc_core::size_class::{round_up_pow2, SizeClass};
 
-/// Header stored before each allocation to track size
+/// Header stored before each allocation to track size and base
 #[repr(C)]
 struct AllocHeader {
     /// Size requested by the user (not including header)
     size: usize,
     /// Number of pages allocated
     pages: usize,
+    /// Offset from header to allocation base (in bytes)
+    base_offset: usize,
 }
 
 const HEADER_SIZE: usize = core::mem::size_of::<AllocHeader>();
+const HEADER_ALIGN: usize = core::mem::align_of::<AllocHeader>();
 const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 
 pub struct AethAlloc;
@@ -28,59 +33,45 @@ impl AethAlloc {
         AethAlloc
     }
 
-    /// Get the header from a user pointer
-    ///
-    /// # Safety
-    /// ptr must be a valid pointer returned from alloc()
     unsafe fn header_from_ptr(ptr: *mut u8) -> *mut AllocHeader {
         ptr.sub(HEADER_SIZE) as *mut AllocHeader
     }
 
-    /// Get the user pointer from an allocation base
-    ///
-    /// # Safety
-    /// base must be a valid pointer to the start of allocated memory
-    unsafe fn ptr_from_base(base: NonNull<u8>) -> *mut u8 {
-        base.as_ptr().add(HEADER_SIZE)
+    fn align_up(addr: usize, align: usize) -> usize {
+        (addr + align - 1) & !(align - 1)
     }
 }
 
-// SAFETY: This allocator is thread-safe. All operations use the PageAllocator
-// which internally uses atomic operations for mmap/munmap. The header-based
-// size tracking ensures each pointer maps to exactly one allocation.
 unsafe impl GlobalAlloc for AethAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
-        let align = layout.align();
+        let align = layout.align().max(HEADER_ALIGN);
 
         if size == 0 {
             return core::ptr::null_mut();
         }
 
-        // Calculate total size needed (header + user data, aligned)
-        let total_size = size + HEADER_SIZE;
+        let total_size = size + HEADER_SIZE + align - 1;
+        let pages = total_size.div_ceil(PAGE_SIZE).max(1);
 
-        // Determine allocation strategy based on size class
-        let size_class = SizeClass::classify(size);
-        let pages = match size_class {
-            SizeClass::Tiny | SizeClass::Small => {
-                let rounded = round_up_pow2(total_size.max(align));
-                let page_aligned = rounded.max(PAGE_SIZE);
-                let p = page_aligned / PAGE_SIZE;
-                p.max(1)
-            }
-            SizeClass::Medium | SizeClass::Large => total_size.div_ceil(PAGE_SIZE),
-        };
-
-        // Allocate pages
         match PageAllocator::alloc(pages) {
             Some(base) => {
-                // Store header at the beginning
-                let header_ptr = base.as_ptr() as *mut AllocHeader;
-                core::ptr::write(header_ptr, AllocHeader { size, pages });
+                let base_addr = base.as_ptr() as usize;
+                let user_addr = Self::align_up(base_addr + HEADER_SIZE, align);
+                let header_addr = user_addr - HEADER_SIZE;
+                let base_offset = header_addr - base_addr;
 
-                // Return pointer after header
-                Self::ptr_from_base(base)
+                let header_ptr = header_addr as *mut AllocHeader;
+                core::ptr::write(
+                    header_ptr,
+                    AllocHeader {
+                        size,
+                        pages,
+                        base_offset,
+                    },
+                );
+
+                user_addr as *mut u8
             }
             None => core::ptr::null_mut(),
         }
@@ -91,14 +82,18 @@ unsafe impl GlobalAlloc for AethAlloc {
             return;
         }
 
-        // Read header to get allocation info
         let header = Self::header_from_ptr(ptr);
-        let AllocHeader { pages, .. } = core::ptr::read(header);
+        let AllocHeader {
+            pages, base_offset, ..
+        } = core::ptr::read(header);
 
-        // Get base pointer (before header)
-        let base = NonNull::new_unchecked(ptr.sub(HEADER_SIZE));
+        if pages == 0 {
+            return;
+        }
 
-        // Free the pages
+        let header_addr = header as usize;
+        let base_addr = header_addr - base_offset;
+        let base = NonNull::new_unchecked(base_addr as *mut u8);
         PageAllocator::dealloc(base, pages);
     }
 }
