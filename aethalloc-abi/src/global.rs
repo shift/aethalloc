@@ -32,7 +32,7 @@ struct PageHeader {
 }
 
 const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
-const CACHE_HEADER_SIZE: usize = core::mem::size_of::<usize>();
+const CACHE_HEADER_SIZE: usize = 16;
 
 #[cfg(not(feature = "magazine-caching"))]
 struct GlobalFreeList {
@@ -48,14 +48,14 @@ impl GlobalFreeList {
     }
 
     #[inline]
-    unsafe fn push(&self, block: *mut u8) {
+    unsafe fn push_batch(&self, batch_head: *mut u8, batch_tail: *mut u8) {
         let mut current = self.head.load(Ordering::Relaxed);
         loop {
-            core::ptr::write(block as *mut *mut u8, current);
+            core::ptr::write(batch_tail as *mut *mut u8, current);
             match self.head.compare_exchange_weak(
                 current,
-                block,
-                Ordering::Relaxed,
+                batch_head,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return,
@@ -415,10 +415,10 @@ unsafe impl GlobalAlloc for AethAlloc {
 
                 let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
-                    let size_ptr = base.as_ptr() as *mut usize;
-                    core::ptr::write(size_ptr, size);
+                    let base_ptr = base.as_ptr();
+                    core::ptr::write(base_ptr as *mut usize, size);
                     cache.metrics.maybe_flush();
-                    return size_ptr.add(1) as *mut u8;
+                    return base_ptr.add(CACHE_HEADER_SIZE);
                 }
                 return core::ptr::null_mut();
             }
@@ -471,18 +471,27 @@ unsafe impl GlobalAlloc for AethAlloc {
                     cache.metrics.frees += 1;
                     cache.metrics.maybe_flush();
 
-                    // Anti-hoarding: flush excess to global free list
+                    // Anti-hoarding: flush excess to global free list with O(1) batch push
                     if cache.counts[class] >= MAX_FREE_LIST_LENGTH {
                         let flush_count = cache.counts[class] / 2;
-                        for _ in 0..flush_count {
-                            let block = cache.heads[class];
-                            if block.is_null() {
-                                break;
-                            }
-                            let next = core::ptr::read(block as *mut *mut u8);
-                            cache.heads[class] = next;
-                            cache.counts[class] -= 1;
-                            GLOBAL_FREE_LISTS[class].push(block);
+
+                        let batch_head = cache.heads[class];
+                        let mut batch_tail = batch_head;
+                        let mut walked = 1usize;
+
+                        while walked < flush_count && !batch_tail.is_null() {
+                            batch_tail = core::ptr::read(batch_tail as *mut *mut u8);
+                            walked += 1;
+                        }
+
+                        if !batch_tail.is_null() {
+                            let new_local_head = core::ptr::read(batch_tail as *mut *mut u8);
+                            core::ptr::write(batch_tail as *mut *mut u8, core::ptr::null_mut());
+
+                            cache.heads[class] = new_local_head;
+                            cache.counts[class] -= flush_count;
+
+                            GLOBAL_FREE_LISTS[class].push_batch(batch_head, batch_tail);
                         }
                     }
                     return;
@@ -570,10 +579,10 @@ unsafe impl GlobalAlloc for AethAlloc {
 
                 let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
-                    let size_ptr = base.as_ptr() as *mut usize;
-                    core::ptr::write(size_ptr, size);
+                    let base_ptr = base.as_ptr();
+                    core::ptr::write(base_ptr as *mut usize, size);
                     cache.metrics.maybe_flush();
-                    return size_ptr.add(1) as *mut u8;
+                    return base_ptr.add(CACHE_HEADER_SIZE);
                 }
                 return core::ptr::null_mut();
             }
