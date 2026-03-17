@@ -88,11 +88,14 @@ This allocator explores techniques that require:
 ## Building
 
 ```bash
-# Build the shared library
+# Build the shared library (default: simple-cache mode)
 nix build
 
 # Or with cargo directly
 cargo build --release -p aethalloc-abi
+
+# Build with magazine-caching mode (for cross-thread heavy workloads)
+cargo build --release -p aethalloc-abi --features magazine-caching
 ```
 
 ## Usage
@@ -104,6 +107,23 @@ LD_PRELOAD=./target/release/libaethalloc_abi.so ./your-program
 # With Nix wrapper
 nix run .#suricata-aeth
 ```
+
+## Feature Flags
+
+| Feature | Description | When to use |
+|---------|-------------|--------------|
+| `simple-cache` (default) | Thread-local free-list per size class | Independent thread workloads, low cross-thread frees |
+| `magazine-caching` | Hoard-style magazines with global pool | Heavy cross-thread memory transfers, producer-consumer patterns |
+
+Use `simple-cache` (default) for:
+- Network packet processing
+- Single-threaded applications
+- Low contention scenarios
+
+Use `magazine-caching` for:
+- Multi-producer workloads
+- Thread pools with frequent cross-thread frees
+- High contention scenarios
 
 ## Benchmarks
 

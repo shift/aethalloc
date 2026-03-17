@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["simple-cache"]
+magazine-caching = ["aethalloc-core/magazine"]
+simple-cache = []
+
 [dependencies]
 aethalloc-core = { path = "../aethalloc-core" }
 libc = { version = "0.2", default-features = false }

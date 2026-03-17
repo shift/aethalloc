@@ -15,6 +15,7 @@ slab = []
 buddy = []
 thread-local = []
 aethalloc-audit = []
+magazine = []
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
