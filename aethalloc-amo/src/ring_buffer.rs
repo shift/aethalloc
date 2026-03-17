@@ -1,40 +1,97 @@
 //! SPSC lock-free ring buffer for AMO
 //!
 //! This module implements a Single-Producer/Single-Consumer lock-free queue
-//! for sending commands from the application core to the support core.
+//! optimized for L1 cache locality using:
+//! 1. Cache-line padding to prevent false sharing between head/tail
+//! 2. Shadow indices to avoid cross-core atomic loads
 
+use core::cell::Cell;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::command::RingEntry;
 
-/// SPSC ring buffer with power-of-2 capacity
-///
-/// This is a wait-free single-producer/single-consumer queue.
-/// Producer: push() - only one thread may call this
-/// Consumer: pop() - only one thread may call this
+/// Cache line size on x86_64 and ARM
+const CACHE_LINE: usize = 64;
+
+/// Padded atomic to prevent false sharing
 #[repr(C, align(64))]
-pub struct RingBuffer<const CAPACITY: usize> {
-    /// Buffer storage
-    buffer: [UnsafeCell<RingEntry>; CAPACITY],
-    /// Producer index (only modified by producer)
-    head: AtomicUsize,
-    /// Consumer index (only modified by consumer)
-    tail: AtomicUsize,
-    /// Cache-line padding to prevent false sharing
-    _pad: [u8; 64],
+struct PaddedAtomicUsize {
+    value: AtomicUsize,
+    _pad: [u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
 }
 
-// SAFETY: SPSC ring buffer is Sync because:
-// - Only one producer thread modifies head
-// - Only one consumer thread modifies tail
-// - Buffer slots are written by producer before head is incremented (Release)
-// - Buffer slots are read by consumer after head is observed (Acquire)
-// - No two threads access the same slot simultaneously
-unsafe impl<const CAPACITY: usize> Sync for RingBuffer<CAPACITY> {}
+impl PaddedAtomicUsize {
+    const fn new(val: usize) -> Self {
+        Self {
+            value: AtomicUsize::new(val),
+            _pad: [0; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
+        }
+    }
 
-// SAFETY: SPSC ring buffer is Send because it can be safely transferred
-// between threads. The Sync impl guarantees thread-safe access once shared.
+    #[inline]
+    fn load(&self, order: Ordering) -> usize {
+        self.value.load(order)
+    }
+
+    #[inline]
+    fn store(&self, val: usize, order: Ordering) {
+        self.value.store(val, order)
+    }
+}
+
+/// Padded Cell for shadow indices
+#[repr(C, align(64))]
+struct PaddedCellUsize {
+    value: Cell<usize>,
+    _pad: [u8; CACHE_LINE - core::mem::size_of::<Cell<usize>>()],
+}
+
+impl PaddedCellUsize {
+    const fn new(val: usize) -> Self {
+        Self {
+            value: Cell::new(val),
+            _pad: [0; CACHE_LINE - core::mem::size_of::<Cell<usize>>()],
+        }
+    }
+
+    #[inline]
+    fn get(&self) -> usize {
+        self.value.get()
+    }
+
+    #[inline]
+    fn set(&self, val: usize) {
+        self.value.set(val)
+    }
+}
+
+/// SPSC ring buffer with power-of-2 capacity
+///
+/// Optimized for L1 cache locality:
+/// - `head` and `tail` are on separate cache lines (no false sharing)
+/// - Shadow indices avoid atomic loads on every operation
+#[repr(C, align(64))]
+pub struct RingBuffer<const CAPACITY: usize> {
+    /// Producer index (only modified by producer)
+    /// Padded to own entire cache line
+    head: PaddedAtomicUsize,
+
+    /// Consumer index (only modified by consumer)  
+    /// Padded to own entire cache line
+    tail: PaddedAtomicUsize,
+
+    /// Producer's shadow copy of tail (kept in L1)
+    shadow_tail: PaddedCellUsize,
+
+    /// Consumer's shadow copy of head (kept in L1)
+    shadow_head: PaddedCellUsize,
+
+    /// Buffer storage (cache-aligned entries)
+    buffer: [UnsafeCell<RingEntry>; CAPACITY],
+}
+
+unsafe impl<const CAPACITY: usize> Sync for RingBuffer<CAPACITY> {}
 unsafe impl<const CAPACITY: usize> Send for RingBuffer<CAPACITY> {}
 
 impl<const CAPACITY: usize> Default for RingBuffer<CAPACITY> {
@@ -44,71 +101,67 @@ impl<const CAPACITY: usize> Default for RingBuffer<CAPACITY> {
 }
 
 impl<const CAPACITY: usize> RingBuffer<CAPACITY> {
-    /// Create a new ring buffer
-    ///
-    /// # Panics
-    /// Panics at compile time if CAPACITY is not a power of 2
     pub const fn new() -> Self {
         assert!(CAPACITY.is_power_of_two(), "capacity must be power of 2");
 
-        // SAFETY: Zeroed memory is valid for RingEntry because:
-        // - RingCommand::NoOp = 255, but zeroed bytes will be interpreted as 0 (FreeBlock)
-        // - This is fine because entries are only read after being written
-        // - The buffer starts empty, so zeroed entries are never read
         Self {
+            head: PaddedAtomicUsize::new(0),
+            tail: PaddedAtomicUsize::new(0),
+            shadow_tail: PaddedCellUsize::new(0),
+            shadow_head: PaddedCellUsize::new(0),
             buffer: unsafe { core::mem::zeroed() },
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            _pad: [0; 64],
         }
     }
 
-    /// Get the number of entries currently in the buffer
+    #[inline]
     pub fn len(&self) -> usize {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
         head.wrapping_sub(tail) & (CAPACITY - 1)
     }
 
-    /// Check if the buffer is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Check if the buffer is full
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.len() == CAPACITY - 1
     }
 
     /// Try to push an entry (non-blocking)
     /// Returns None if buffer is full
+    ///
+    /// Optimized: Only performs atomic load of tail when shadow indicates full
+    #[inline]
     pub fn try_push(&self, entry: RingEntry) -> Option<()> {
         let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-
         let next_head = (head + 1) & (CAPACITY - 1);
 
-        // Check if full (head catches up to tail)
-        if next_head == tail {
-            return None;
+        // Fast path: check shadow tail (L1 cache, no cross-core traffic)
+        let mut shadow_tail = self.shadow_tail.get();
+
+        if next_head == shadow_tail {
+            // Slow path: shadow says full, check actual tail (cache miss)
+            shadow_tail = self.tail.load(Ordering::Acquire);
+            self.shadow_tail.set(shadow_tail);
+
+            if next_head == shadow_tail {
+                return None;
+            }
         }
 
-        // SAFETY: We have exclusive write access to slots[head] because:
-        // - Producer owns the head position
-        // - Consumer never reads slots[head] because head != tail implies not empty
-        // - We write before incrementing head, so consumer won't see partial data
+        // SAFETY: Producer owns slots[head], consumer never reads it
         unsafe {
             core::ptr::write(self.buffer[head].get(), entry);
         }
 
-        // Publish the entry (Release ensures write is visible before head update)
         self.head.store(next_head, Ordering::Release);
-
         Some(())
     }
 
-    /// Push an entry, spinning until space is available
-    /// WARNING: This can spin forever if consumer is dead
+    #[inline]
     pub fn push(&self, entry: RingEntry) {
         while self.try_push(entry).is_none() {
             core::hint::spin_loop();
@@ -117,30 +170,35 @@ impl<const CAPACITY: usize> RingBuffer<CAPACITY> {
 
     /// Try to pop an entry (non-blocking)
     /// Returns None if buffer is empty
+    ///
+    /// Optimized: Only performs atomic load of head when shadow indicates empty
+    #[inline]
     pub fn try_pop(&self) -> Option<RingEntry> {
         let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
 
-        // Check if empty
-        if tail == head {
-            return None;
+        // Fast path: check shadow head (L1 cache, no cross-core traffic)
+        let mut shadow_head = self.shadow_head.get();
+
+        if tail == shadow_head {
+            // Slow path: shadow says empty, check actual head (cache miss)
+            shadow_head = self.head.load(Ordering::Acquire);
+            self.shadow_head.set(shadow_head);
+
+            if tail == shadow_head {
+                return None;
+            }
         }
 
-        // SAFETY: We have exclusive read access to slots[tail] because:
-        // - Consumer owns the tail position
-        // - Producer never writes to slots[tail] because tail != head implies not full
-        // - We read after observing head update (Acquire), so data is visible
+        // SAFETY: Consumer owns slots[tail], producer never writes it
         let entry = unsafe { core::ptr::read(self.buffer[tail].get()) };
 
-        // Advance tail (Release ensures read completes before tail update)
         let next_tail = (tail + 1) & (CAPACITY - 1);
         self.tail.store(next_tail, Ordering::Release);
 
         Some(entry)
     }
 
-    /// Pop an entry, spinning until one is available
-    /// WARNING: This can spin forever if producer is dead
+    #[inline]
     pub fn pop(&self) -> RingEntry {
         loop {
             if let Some(entry) = self.try_pop() {
@@ -150,12 +208,10 @@ impl<const CAPACITY: usize> RingBuffer<CAPACITY> {
         }
     }
 
-    /// Get capacity
     pub const fn capacity(&self) -> usize {
         CAPACITY
     }
 }
 
-// Verify RingEntry is exactly 64 bytes at compile time
 const _: () = assert!(core::mem::size_of::<RingEntry>() == 64);
 const _: () = assert!(core::mem::align_of::<RingEntry>() == 64);
