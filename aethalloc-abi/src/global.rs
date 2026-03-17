@@ -1,106 +1,38 @@
-//! Global allocator implementation with size tracking
+//! Global allocator implementation with page-level metadata
 //!
-//! This allocator uses thread-local caching for small allocations (<=8KB)
-//! and falls back to direct mmap for larger allocations.
+//! Uses ELF-native TLS for thread-local caching (no libc dependencies).
+//! Metadata is stored at page level for large allocations, inline for cached allocations.
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
-use aethalloc_core::thread_local::ThreadLocalCache;
+
+const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
+const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
 const MAX_CACHE_SIZE: usize = 8192;
-const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
+
+const MAGIC: u32 = 0xA7E8A110;
 
 #[repr(C)]
-struct AllocHeader {
-    size: usize,
-    pages: usize,
-    base_offset: usize,
+struct PageHeader {
+    magic: u32,
+    num_pages: u16,
+    requested_size: usize,
 }
 
-const HEADER_SIZE: usize = core::mem::size_of::<AllocHeader>();
-const HEADER_ALIGN: usize = core::mem::align_of::<AllocHeader>();
+const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
+const CACHE_HEADER_SIZE: usize = core::mem::size_of::<usize>();
 
-static TLS_KEY: AtomicUsize = AtomicUsize::new(0);
-static TLS_KEY_INIT: AtomicBool = AtomicBool::new(false);
-
-fn get_thread_cache() -> Option<*mut ThreadLocalCache> {
-    let key = TLS_KEY.load(Ordering::Acquire);
-    if key == 0 {
-        return None;
-    }
-    let real_key = (key - 1) as libc::pthread_key_t;
-
-    unsafe {
-        let ptr = libc::pthread_getspecific(real_key);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(ptr as *mut ThreadLocalCache)
-        }
-    }
-}
-
-fn ensure_thread_cache() -> Option<*mut ThreadLocalCache> {
-    if !TLS_KEY_INIT.load(Ordering::Acquire) {
-        let mut key: libc::pthread_key_t = 0;
-        unsafe {
-            if libc::pthread_key_create(&mut key, Some(tls_destructor)) != 0 {
-                return None;
-            }
-        }
-        TLS_KEY.store(key.wrapping_add(1) as usize, Ordering::Release);
-        TLS_KEY_INIT.store(true, Ordering::Release);
-    }
-
-    let key = TLS_KEY.load(Ordering::Acquire);
-    if key == 0 {
-        return None;
-    }
-    let real_key = (key - 1) as libc::pthread_key_t;
-
-    unsafe {
-        let ptr = libc::pthread_getspecific(real_key);
-        if !ptr.is_null() {
-            return Some(ptr as *mut ThreadLocalCache);
-        }
-
-        let cache_ptr = libc::mmap(
-            core::ptr::null_mut(),
-            core::mem::size_of::<ThreadLocalCache>(),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-
-        if cache_ptr == libc::MAP_FAILED {
-            return None;
-        }
-
-        let cache = cache_ptr as *mut ThreadLocalCache;
-        core::ptr::write(cache, ThreadLocalCache::new());
-
-        if libc::pthread_setspecific(real_key, cache as *mut libc::c_void) != 0 {
-            libc::munmap(cache_ptr, core::mem::size_of::<ThreadLocalCache>());
-            return None;
-        }
-
-        Some(cache)
-    }
-}
-
-unsafe extern "C" fn tls_destructor(ptr: *mut libc::c_void) {
-    if ptr.is_null() {
-        return;
-    }
-    let cache = ptr as *mut ThreadLocalCache;
-    core::ptr::drop_in_place(cache);
-    libc::munmap(ptr, core::mem::size_of::<ThreadLocalCache>());
-}
+#[no_mangle]
+pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static DIRECT_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct AethAlloc;
 
@@ -109,63 +41,62 @@ impl AethAlloc {
         AethAlloc
     }
 
-    unsafe fn header_from_ptr(ptr: *mut u8) -> *mut AllocHeader {
-        ptr.sub(HEADER_SIZE) as *mut AllocHeader
-    }
-
+    #[inline]
     fn align_up(addr: usize, align: usize) -> usize {
         (addr + align - 1) & !(align - 1)
+    }
+
+    #[inline]
+    unsafe fn page_header_from_ptr(ptr: *mut u8) -> *mut PageHeader {
+        let page_start = (ptr as usize) & PAGE_MASK;
+        page_start as *mut PageHeader
     }
 }
 
 unsafe impl GlobalAlloc for AethAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
-        let align = layout.align().max(HEADER_ALIGN);
+        let align = layout.align();
 
         if size == 0 {
             return core::ptr::null_mut();
         }
 
+        // For small allocations with standard alignment, use simple inline header
         if size <= MAX_CACHE_SIZE && align <= 8 {
-            if let Some(cache_ptr) = ensure_thread_cache() {
-                let cache = &mut *cache_ptr;
-                let total_cache_size = round_up_pow2(size + HEADER_SIZE).max(16);
-                if let Some(ptr) = cache.alloc(total_cache_size) {
-                    let header_ptr = ptr.as_ptr() as *mut AllocHeader;
-                    core::ptr::write(
-                        header_ptr,
-                        AllocHeader {
-                            size,
-                            pages: 0,
-                            base_offset: 0,
-                        },
-                    );
-                    return header_ptr.add(1) as *mut u8;
-                }
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+
+            let cache_size = round_up_pow2(size).max(16);
+            let alloc_size = cache_size + CACHE_HEADER_SIZE;
+
+            let pages = alloc_size.div_ceil(PAGE_SIZE).max(1);
+
+            if let Some(base) = PageAllocator::alloc(pages) {
+                let size_ptr = base.as_ptr() as *mut usize;
+                core::ptr::write(size_ptr, size);
+                return size_ptr.add(1) as *mut u8;
             }
+            return core::ptr::null_mut();
         }
 
-        let total_size = size + HEADER_SIZE + align - 1;
-        let pages = total_size.div_ceil(PAGE_SIZE).max(1);
+        DIRECT_ALLOCS.fetch_add(1, Ordering::Relaxed);
+
+        let min_size = PAGE_HEADER_SIZE + size + align;
+        let pages = min_size.div_ceil(PAGE_SIZE).max(1);
 
         match PageAllocator::alloc(pages) {
             Some(base) => {
                 let base_addr = base.as_ptr() as usize;
-                let user_addr = Self::align_up(base_addr + HEADER_SIZE, align);
-                let header_addr = user_addr - HEADER_SIZE;
-                let base_offset = header_addr - base_addr;
 
-                let header_ptr = header_addr as *mut AllocHeader;
-                core::ptr::write(
-                    header_ptr,
-                    AllocHeader {
-                        size,
-                        pages,
-                        base_offset,
-                    },
-                );
+                let header = PageHeader {
+                    magic: MAGIC,
+                    num_pages: pages as u16,
+                    requested_size: size,
+                };
+                let header_ptr = base.as_ptr() as *mut PageHeader;
+                core::ptr::write(header_ptr, header);
 
+                let user_addr = Self::align_up(base_addr + PAGE_HEADER_SIZE, align);
                 user_addr as *mut u8
             }
             None => core::ptr::null_mut(),
@@ -177,31 +108,32 @@ unsafe impl GlobalAlloc for AethAlloc {
             return;
         }
 
-        let header = Self::header_from_ptr(ptr);
-        let AllocHeader {
-            size,
-            pages,
-            base_offset,
-        } = core::ptr::read(header);
+        let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
+        let maybe_size = core::ptr::read(size_ptr);
 
-        if pages == 0 && size <= MAX_CACHE_SIZE {
-            if let Some(cache_ptr) = get_thread_cache() {
-                let cache = &mut *cache_ptr;
-                let total_cache_size = round_up_pow2(size + HEADER_SIZE).max(16);
-                let cache_ptr = NonNull::new_unchecked(header as *mut u8);
-                cache.dealloc(cache_ptr, total_cache_size);
+        // Check if this is a small allocation (size stored inline)
+        if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
+            let potential_header = size_ptr as *mut PageHeader;
+            // Verify this isn't actually a page header by checking magic
+            if core::ptr::read(potential_header).magic != MAGIC {
+                // This is a small allocation, free it directly
+                let cache_size = round_up_pow2(maybe_size).max(16);
+                let alloc_size = cache_size + CACHE_HEADER_SIZE;
+                let pages = alloc_size.div_ceil(PAGE_SIZE).max(1);
+                let base = NonNull::new_unchecked(size_ptr as *mut u8);
+                PageAllocator::dealloc(base, pages);
                 return;
             }
         }
 
-        if pages == 0 {
-            return;
-        }
+        // This is a large allocation - find page header and free
+        let header = Self::page_header_from_ptr(ptr);
+        let header_ref = core::ptr::read(header);
 
-        let header_addr = header as usize;
-        let base_addr = header_addr - base_offset;
-        let base = NonNull::new_unchecked(base_addr as *mut u8);
-        PageAllocator::dealloc(base, pages);
+        if header_ref.magic == MAGIC && header_ref.num_pages > 0 {
+            let base = NonNull::new_unchecked(header as *mut u8);
+            PageAllocator::dealloc(base, header_ref.num_pages as usize);
+        }
     }
 }
 
@@ -209,6 +141,23 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
     if ptr.is_null() {
         return 0;
     }
-    let header = AethAlloc::header_from_ptr(ptr);
-    core::ptr::read(header).size
+
+    let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
+    let maybe_size = core::ptr::read(size_ptr);
+
+    if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
+        let potential_header = size_ptr as *mut PageHeader;
+        if core::ptr::read(potential_header).magic != MAGIC {
+            return maybe_size;
+        }
+    }
+
+    let header = AethAlloc::page_header_from_ptr(ptr);
+    let header_ref = core::ptr::read(header);
+
+    if header_ref.magic == MAGIC {
+        header_ref.requested_size
+    } else {
+        0
+    }
 }
