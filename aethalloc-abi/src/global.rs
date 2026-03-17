@@ -5,7 +5,6 @@
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
@@ -26,13 +25,6 @@ struct PageHeader {
 
 const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
 const CACHE_HEADER_SIZE: usize = core::mem::size_of::<usize>();
-
-#[no_mangle]
-pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
-#[no_mangle]
-pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
-#[no_mangle]
-pub static DIRECT_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 /// Thread-local cache of free blocks per size class
 struct ThreadCache {
@@ -122,14 +114,11 @@ unsafe impl GlobalAlloc for AethAlloc {
                     let next = core::ptr::read(head as *mut *mut u8);
                     cache.heads[class] = next;
                     cache.counts[class] -= 1;
-                    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 
                     // Store size and return
                     core::ptr::write(head as *mut usize, size);
                     return head.add(CACHE_HEADER_SIZE);
                 }
-
-                CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
                 // Batch-allocate: carve one page into multiple blocks
                 let block_size = cache_size + CACHE_HEADER_SIZE;
@@ -163,8 +152,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                 return core::ptr::null_mut();
             }
         }
-
-        DIRECT_ALLOCS.fetch_add(1, Ordering::Relaxed);
 
         let min_size = PAGE_HEADER_SIZE + size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);

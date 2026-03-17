@@ -16,9 +16,11 @@ extern crate std;
 
 pub mod buddy;
 pub mod global_pool;
+pub mod magazine;
 pub mod page;
 pub mod size_class;
 pub mod slab;
 pub mod thread_local;
 
 pub use global_pool::GlobalPools;
+pub use magazine::{GlobalMagazinePools, Magazine, MAGAZINE_CAPACITY, NUM_SIZE_CLASSES};
