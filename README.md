@@ -49,12 +49,12 @@ AethAlloc is a production-grade memory allocator featuring:
 ## Deployment Targets
 
 ### m720q Gateway (Multi-WAN Routing)
-- **Producer-Consumer**: 670K ops/s (+28% vs glibc)
+- **Producer-Consumer**: 622K ops/s (+26% vs glibc)
 - Guarantees line-rate packet inspection
 - Asynchronous SKB payload handoff between NIC and firewall workers
 
 ### X1 Yoga Workstation (Desktop)
-- **Fragmentation RSS**: 20 MB (11x better than glibc)
+- **Fragmentation RSS**: 24 MB (9x better than glibc)
 - Prevents memory bloat in long-running desktop environments
 - Preserves NVMe lifespan and battery capacity
 
@@ -87,28 +87,28 @@ nix run .#suricata-aeth
 
 ## Benchmarks
 
-**Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz  
-**Last updated:** 2026-03-17
+**Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz, 16 GB RAM  
+**Last updated:** 2026-03-18
 
 ### Summary
 
 | Benchmark | glibc | AethAlloc | Ratio |
 |-----------|-------|-----------|-------|
-| Packet Churn | 225K ops/s | 231K ops/s | **103%** |
-| KV Store | 337K ops/s | 377K ops/s | **112%** |
-| Producer-Consumer | 525K ops/s | 670K ops/s | **128%** |
-| Multithread (8T) | 11.6M ops/s | 11.1M ops/s | **96%** |
-| Fragmentation RSS | 219 MB | 20 MB | **11x better** |
+| Packet Churn | 238K ops/s | 245K ops/s | **103%** |
+| KV Store | 328K ops/s | 365K ops/s | **111%** |
+| Producer-Consumer | 493K ops/s | 622K ops/s | **126%** |
+| Multithread (8T) | 6.7M ops/s | 6.5M ops/s | **97%** |
+| Fragmentation RSS | 220 MB | 24 MB | **9x better** |
 
 ### Packet Churn (Network Processing)
 
 64-byte packet allocations simulating network processing workload.
 
 ```
-glibc:       225K ops/s
-AethAlloc:   231K ops/s (+3%)
-P50 latency: 3.5 µs
-P99 latency: 6.8 µs
+glibc:       238K ops/s
+AethAlloc:   245K ops/s (+3%)
+P50 latency: 3.4 µs
+P99 latency: 7.7 µs
 ```
 
 ### KV Store (Redis-like Workload)
@@ -116,11 +116,11 @@ P99 latency: 6.8 µs
 Variable-sized keys (8-64B) and values (16-64KB) with SET/GET/DEL operations.
 
 ```
-glibc:       337K ops/s
-AethAlloc:   377K ops/s (+12%)
-SET latency: 3.5 µs
+glibc:       328K ops/s
+AethAlloc:   365K ops/s (+11%)
+SET latency: 3.6 µs
 GET latency: 0.6 µs
-DEL latency: 0.7 µs
+DEL latency: 0.9 µs
 ```
 
 ### Producer-Consumer (Cross-Thread Frees)
@@ -128,9 +128,9 @@ DEL latency: 0.7 µs
 Thread A allocates, Thread B frees. Simulates network packet handoff.
 
 ```
-glibc:       525K ops/s
-AethAlloc:   670K ops/s (+28%)
-Memory:      Stable at 138 MB (anti-hoarding active)
+glibc:       493K ops/s
+AethAlloc:   622K ops/s (+26%)
+Memory:      Stable with anti-hoarding active
 ```
 
 ### Multithread Churn (8 Threads)
@@ -138,9 +138,9 @@ Memory:      Stable at 138 MB (anti-hoarding active)
 Concurrent allocations (16B - 4KB) across 8 threads with heavy contention.
 
 ```
-glibc:       11.6M ops/s
-AethAlloc:   11.1M ops/s (96%)
-Avg latency: 450 ns
+glibc:       6.7M ops/s
+AethAlloc:   6.5M ops/s (97%)
+Avg latency: 834 ns
 ```
 
 ### Fragmentation (Long-running Server)
@@ -148,9 +148,9 @@ Avg latency: 450 ns
 Mixed allocation sizes (16B - 1MB) over 1M iterations.
 
 ```
-glibc:       219 MB RSS
-AethAlloc:   20 MB RSS (11x better)
-Throughput:  214K ops/s
+glibc:       220 MB RSS
+AethAlloc:   24 MB RSS (9x better)
+Throughput:  232K ops/s
 ```
 
 ## Technical Implementation
