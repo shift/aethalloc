@@ -4,7 +4,6 @@
 //! free lists for small allocations.
 
 use alloc::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -72,10 +71,12 @@ impl ThreadCache {
 }
 
 /// Thread-local storage
-static mut THREAD_CACHE: UnsafeCell<ThreadCache> = UnsafeCell::new(ThreadCache::new());
+#[thread_local]
+static mut THREAD_CACHE: ThreadCache = ThreadCache::new();
 
+#[inline(always)]
 unsafe fn get_thread_cache() -> &'static mut ThreadCache {
-    &mut *THREAD_CACHE.get()
+    &mut *core::ptr::addr_of_mut!(THREAD_CACHE)
 }
 
 pub struct AethAlloc;
