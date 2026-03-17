@@ -33,6 +33,14 @@ struct PageHeader {
 
 const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
 const CACHE_HEADER_SIZE: usize = 16;
+const LARGE_HEADER_SIZE: usize = 16;
+const LARGE_MAGIC: u32 = 0xA7E8A11F;
+
+#[repr(C)]
+struct LargeAllocHeader {
+    magic: u32,
+    base_ptr: *mut u8,
+}
 
 #[cfg(not(feature = "magazine-caching"))]
 struct GlobalFreeList {
@@ -429,20 +437,28 @@ unsafe impl GlobalAlloc for AethAlloc {
         cache.metrics.allocs += 1;
         cache.metrics.maybe_flush();
 
-        let min_size = PAGE_HEADER_SIZE + size + align;
+        let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);
 
         match PageAllocator::alloc(pages) {
             Some(base) => {
                 let base_addr = base.as_ptr() as usize;
-                let header = PageHeader {
+                
+                let page_header = PageHeader {
                     magic: MAGIC,
                     num_pages: pages as u16,
-                    requested_size: size,
+                    requested_size: 0,
                 };
-                let header_ptr = base.as_ptr() as *mut PageHeader;
-                core::ptr::write(header_ptr, header);
-                let user_addr = Self::align_up(base_addr + PAGE_HEADER_SIZE, align);
+                core::ptr::write(base.as_ptr() as *mut PageHeader, page_header);
+                
+                let user_addr = Self::align_up(base_addr + PAGE_HEADER_SIZE + LARGE_HEADER_SIZE, align);
+                
+                let large_header = LargeAllocHeader {
+                    magic: LARGE_MAGIC,
+                    base_ptr: base.as_ptr(),
+                };
+                core::ptr::write((user_addr - LARGE_HEADER_SIZE) as *mut LargeAllocHeader, large_header);
+                
                 user_addr as *mut u8
             }
             None => core::ptr::null_mut(),
@@ -451,6 +467,22 @@ unsafe impl GlobalAlloc for AethAlloc {
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
+            return;
+        }
+
+        // Check for large allocation first (LargeAllocHeader immediately before ptr)
+        let large_header_addr = ptr.sub(LARGE_HEADER_SIZE) as *const LargeAllocHeader;
+        if core::ptr::read(large_header_addr).magic == LARGE_MAGIC {
+            let base_ptr = core::ptr::read(large_header_addr).base_ptr;
+            let page_header = core::ptr::read(base_ptr as *const PageHeader);
+            
+            if page_header.magic == MAGIC && page_header.num_pages > 0 {
+                PageAllocator::dealloc(NonNull::new_unchecked(base_ptr), page_header.num_pages as usize);
+            }
+            
+            let cache = get_thread_cache();
+            cache.metrics.frees += 1;
+            cache.metrics.maybe_flush();
             return;
         }
 
