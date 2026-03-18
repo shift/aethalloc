@@ -100,6 +100,27 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut u8 {
     }
 }
 
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn posix_memalign(memptr: *mut *mut u8, alignment: usize, size: usize) -> i32 {
+    if alignment == 0
+        || !alignment.is_power_of_two()
+        || !alignment.is_multiple_of(core::mem::size_of::<*mut u8>())
+    {
+        return 22; // EINVAL
+    }
+
+    let ptr = aligned_alloc(alignment, size);
+    if ptr.is_null() && size != 0 {
+        return 12; // ENOMEM
+    }
+
+    unsafe {
+        *memptr = ptr;
+    }
+    0
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

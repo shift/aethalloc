@@ -153,6 +153,24 @@ AethAlloc:   24 MB RSS (9x better)
 Throughput:  232K ops/s
 ```
 
+### Tail Latency (P99/P99.9)
+
+80,000 operations across 8 threads measuring per-operation latency.
+
+```
+glibc:       P50=84ns  P99=103ns  P99.9=127ns  P99.99=26µs  Max=2.3ms
+AethAlloc:   P50=93ns  P99=116ns  P99.9=600ns  P99.99=10µs  Max=2.1ms
+```
+
+### Massive Allocations (>1GB)
+
+Huge contiguous allocations with high alignment.
+
+```
+glibc:       256MB, 512MB, 1GB, 1GB@2MB-align, 2GB - all PASS
+AethAlloc:   256MB, 512MB, 1GB, 1GB@2MB-align, 2GB - all PASS
+```
+
 ## Technical Implementation
 
 ### SIMD Alignment
@@ -200,6 +218,10 @@ cargo test --all
 # Run benchmarks
 gcc -O3 -pthread benches/packet_churn.c -o /tmp/packet_churn
 LD_PRELOAD=./target/release/libaethalloc_abi.so /tmp/packet_churn
+
+# Run stress tests
+gcc -O3 benches/corruption_test.c -o /tmp/corruption_test
+LD_PRELOAD=./target/release/libaethalloc_abi.so /tmp/corruption_test
 ```
 
 ## Status
@@ -212,6 +234,8 @@ LD_PRELOAD=./target/release/libaethalloc_abi.so /tmp/packet_churn
 | O(1) anti-hoarding | ✅ Complete |
 | Lock-free global pool | ✅ Complete |
 | Benchmarks | ✅ Complete |
+| Stress tests | ✅ Complete |
+| CI/CD | ✅ Complete |
 
 ## License
 

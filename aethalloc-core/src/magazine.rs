@@ -92,6 +92,12 @@ pub struct GlobalMagazinePool {
     empty_head: AtomicPtr<MagazineNode>,
 }
 
+impl Default for GlobalMagazinePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GlobalMagazinePool {
     pub const fn new() -> Self {
         Self {
@@ -101,13 +107,15 @@ impl GlobalMagazinePool {
     }
 
     /// Push a full magazine to the global pool
+    ///
+    /// # Safety
+    /// `node` must be a valid pointer to a `MagazineNode` that is not already
+    /// in any pool. The caller must ensure exclusive access to `node`.
     #[inline]
-    pub fn push_full(&self, node: *mut MagazineNode) {
+    pub unsafe fn push_full(&self, node: *mut MagazineNode) {
         let mut current = self.full_head.load(Ordering::Relaxed);
         loop {
-            unsafe {
-                (*node).next = current;
-            }
+            (*node).next = current;
             match self.full_head.compare_exchange_weak(
                 current,
                 node,
@@ -142,13 +150,15 @@ impl GlobalMagazinePool {
     }
 
     /// Push an empty magazine to the global pool
+    ///
+    /// # Safety
+    /// `node` must be a valid pointer to a `MagazineNode` that is not already
+    /// in any pool. The caller must ensure exclusive access to `node`.
     #[inline]
-    pub fn push_empty(&self, node: *mut MagazineNode) {
+    pub unsafe fn push_empty(&self, node: *mut MagazineNode) {
         let mut current = self.empty_head.load(Ordering::Relaxed);
         loop {
-            unsafe {
-                (*node).next = current;
-            }
+            (*node).next = current;
             match self.empty_head.compare_exchange_weak(
                 current,
                 node,
@@ -188,6 +198,12 @@ pub struct GlobalMagazinePools {
     pools: [GlobalMagazinePool; NUM_SIZE_CLASSES],
 }
 
+impl Default for GlobalMagazinePools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GlobalMagazinePools {
     pub const fn new() -> Self {
         Self {
@@ -205,6 +221,12 @@ impl GlobalMagazinePools {
 pub struct MetadataAllocator {
     current_page: AtomicPtr<u8>,
     offset: AtomicUsize,
+}
+
+impl Default for MetadataAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MetadataAllocator {
@@ -343,7 +365,9 @@ mod tests {
         let pool = GlobalMagazinePool::new();
 
         let node = Box::into_raw(Box::new(MagazineNode::new()));
-        pool.push_full(node);
+        unsafe {
+            pool.push_full(node);
+        }
 
         let popped = pool.pop_full();
         assert!(popped.is_some());
@@ -367,15 +391,17 @@ mod tests {
         }
 
         // Push to full, pop from full
-        pool.push_full(node);
+        unsafe {
+            pool.push_full(node);
+        }
         let full = pool.pop_full();
         assert!(full.is_some());
 
         // Clear and push to empty
         unsafe {
             (*full.unwrap()).magazine.clear();
+            pool.push_empty(full.unwrap());
         }
-        pool.push_empty(full.unwrap());
 
         // Pop from empty
         let empty = pool.pop_empty();

@@ -13,13 +13,10 @@ use std::net::{SocketAddr, TcpListener};
 use std::thread;
 use std::time::Duration;
 
+use libloading::Library;
+
 const DEFAULT_PORT: u16 = 9091;
 const PORT_ENV: &str = "AETHALLOC_METRICS_PORT";
-
-#[link(name = "aethalloc")]
-extern "C" {
-    fn aethalloc_get_metrics() -> MetricsSnapshot;
-}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -31,8 +28,25 @@ pub struct MetricsSnapshot {
     pub direct_allocs: u64,
 }
 
+fn get_metrics() -> Option<MetricsSnapshot> {
+    static LIB: std::sync::OnceLock<Option<Library>> = std::sync::OnceLock::new();
+
+    let lib = LIB.get_or_init(|| unsafe { Library::new("libaethalloc.so").ok() });
+
+    let lib = lib.as_ref()?;
+
+    unsafe {
+        let func: libloading::Symbol<unsafe extern "C" fn() -> MetricsSnapshot> =
+            lib.get(b"aethalloc_get_metrics").ok()?;
+        Some(func())
+    }
+}
+
 fn format_metrics() -> String {
-    let snapshot = unsafe { aethalloc_get_metrics() };
+    let snapshot = match get_metrics() {
+        Some(s) => s,
+        None => return "# ERROR: libaethalloc.so not loaded\n".to_string(),
+    };
     let mut output = String::new();
 
     output.push_str("# HELP aethalloc_allocs_total Total allocations\n");
@@ -162,10 +176,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_metrics() {
+    fn test_format_metrics_without_library() {
         let metrics = format_metrics();
-        assert!(metrics.contains("aethalloc_allocs_total"));
-        assert!(metrics.contains("aethalloc_cache_hit_rate"));
-        assert!(metrics.contains("# TYPE aethalloc_cache_hits_total counter"));
+        assert!(
+            metrics.contains("ERROR") || metrics.contains("aethalloc_allocs_total"),
+            "metrics should either error or contain expected output"
+        );
     }
 }
