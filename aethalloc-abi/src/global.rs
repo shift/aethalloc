@@ -586,7 +586,9 @@ unsafe impl GlobalAlloc for AethAlloc {
                     let node = &mut *node_ptr;
                     core::mem::swap(&mut cache.alloc_mags[class], &mut node.magazine);
                     node.magazine.clear();
-                    GLOBAL_MAGAZINES.get(class).push_empty(node_ptr);
+                    unsafe {
+                        GLOBAL_MAGAZINES.get(class).push_empty(node_ptr);
+                    }
 
                     if let Some(block) = cache.alloc_mags[class].pop() {
                         cache.metrics.cache_hits += 1;
@@ -715,7 +717,9 @@ unsafe impl GlobalAlloc for AethAlloc {
                     if !node.is_null() {
                         (*node).magazine = core::mem::take(&mut cache.free_mags[class]);
                         (*node).next = core::ptr::null_mut();
-                        GLOBAL_MAGAZINES.get(class).push_full(node);
+                        unsafe {
+                            GLOBAL_MAGAZINES.get(class).push_full(node);
+                        }
                     }
 
                     // Push to now-empty magazine

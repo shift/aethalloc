@@ -101,10 +101,11 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut u8 {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn posix_memalign(memptr: *mut *mut u8, alignment: usize, size: usize) -> i32 {
     if alignment == 0
         || !alignment.is_power_of_two()
-        || alignment % core::mem::size_of::<*mut u8>() != 0
+        || !alignment.is_multiple_of(core::mem::size_of::<*mut u8>())
     {
         return 22; // EINVAL
     }
