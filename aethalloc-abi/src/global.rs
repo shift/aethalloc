@@ -27,7 +27,7 @@ const MAGIC: u32 = 0xA7E8A110;
 #[repr(C)]
 struct PageHeader {
     magic: u32,
-    num_pages: u16,
+    num_pages: u32,
     requested_size: usize,
 }
 
@@ -446,7 +446,7 @@ unsafe impl GlobalAlloc for AethAlloc {
 
                 let page_header = PageHeader {
                     magic: MAGIC,
-                    num_pages: pages as u16,
+                    num_pages: pages as u32,
                     requested_size: size,
                 };
                 let header_ptr = base.as_ptr() as *mut PageHeader;
@@ -643,7 +643,7 @@ unsafe impl GlobalAlloc for AethAlloc {
 
                 let page_header = PageHeader {
                     magic: MAGIC,
-                    num_pages: pages as u16,
+                    num_pages: pages as u32,
                     requested_size: size,
                 };
                 core::ptr::write(base.as_ptr() as *mut PageHeader, page_header);
