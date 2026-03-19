@@ -16,7 +16,7 @@ Comprehensive performance comparison against industry-standard memory allocators
 
 | Allocator | Version | Source |
 |-----------|---------|--------|
-| **AethAlloc** | 0.1.0 | Built from source |
+| **AethAlloc** | 0.2.1 | Built from source |
 | **glibc** | System | GNU C Library default |
 | **jemalloc** | 5.3.0-unstable-2025-09-12 | nixpkgs |
 | **mimalloc** | 3.1.5 | nixpkgs |
@@ -199,4 +199,4 @@ All benchmarks are in `benches/`:
 
 | Date | Version | Notes |
 |------|---------|-------|
-| 2026-03-19 | 0.1.0 | Initial benchmark suite |
+| 2026-03-19 | 0.2.1 | Full benchmark suite vs competitors |
