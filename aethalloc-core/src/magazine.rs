@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const MAGAZINE_CAPACITY: usize = 64;
 pub const NUM_SIZE_CLASSES: usize = 13;
+pub const MAX_GLOBAL_MAGAZINES_PER_CLASS: usize = 8;
 
 /// Magazine: A container for 64 memory block pointers
 #[repr(C)]
@@ -55,6 +56,20 @@ impl Magazine {
     #[inline]
     pub fn clear(&mut self) {
         self.count = 0;
+    }
+
+    #[inline]
+    pub fn bulk_init(&mut self, base: *mut u8, block_size: usize, count: usize) {
+        let to_add = count.min(MAGAZINE_CAPACITY - self.count);
+        for i in 0..to_add {
+            self.blocks[self.count + i] = unsafe { base.add(i * block_size) };
+        }
+        self.count += to_add;
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
     }
 }
 
@@ -190,6 +205,17 @@ impl GlobalMagazinePool {
                 Err(c) => current = c,
             }
         }
+    }
+
+    #[inline]
+    pub fn full_depth(&self) -> usize {
+        let mut count = 0;
+        let mut current = self.full_head.load(Ordering::Relaxed);
+        while !current.is_null() && count < MAX_GLOBAL_MAGAZINES_PER_CLASS + 1 {
+            current = unsafe { (*current).next };
+            count += 1;
+        }
+        count
     }
 }
 

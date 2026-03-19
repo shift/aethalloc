@@ -6,7 +6,7 @@
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
@@ -19,7 +19,9 @@ const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const MAX_CACHE_SIZE: usize = 65536;
 const NUM_SIZE_CLASSES: usize = 14;
 const METRICS_FLUSH_THRESHOLD: usize = 4096;
+#[cfg(not(feature = "magazine-caching"))]
 const MAX_FREE_LIST_LENGTH: usize = 4096;
+#[cfg(not(feature = "magazine-caching"))]
 const GLOBAL_FREE_BATCH: usize = 128;
 
 const MAGIC: u32 = 0xA7E8A110;
@@ -581,6 +583,18 @@ unsafe impl GlobalAlloc for AethAlloc {
                     return block.add(CACHE_HEADER_SIZE);
                 }
 
+                // Try swap with local free_mag for reuse
+                if !cache.free_mags[class].is_empty() {
+                    core::mem::swap(&mut cache.alloc_mags[class], &mut cache.free_mags[class]);
+                    if let Some(block) = cache.alloc_mags[class].pop() {
+                        cache.metrics.cache_hits += 1;
+                        cache.metrics.allocs += 1;
+                        cache.metrics.maybe_flush();
+                        core::ptr::write(block as *mut usize, size);
+                        return block.add(CACHE_HEADER_SIZE);
+                    }
+                }
+
                 // Try to get a full magazine from global pool
                 if let Some(node_ptr) = GLOBAL_MAGAZINES.get(class).pop_full() {
                     let node = &mut *node_ptr;
@@ -609,9 +623,13 @@ unsafe impl GlobalAlloc for AethAlloc {
                 if blocks_per_page > 1 {
                     if let Some(base) = PageAllocator::alloc(1) {
                         let base_ptr = base.as_ptr();
-                        for i in 1..blocks_per_page {
-                            let block_ptr = base_ptr.add(i * block_size);
-                            let _ = cache.alloc_mags[class].push(block_ptr);
+                        let remaining = blocks_per_page.saturating_sub(1);
+                        if remaining > 0 {
+                            cache.alloc_mags[class].bulk_init(
+                                base_ptr.add(block_size),
+                                block_size,
+                                remaining,
+                            );
                         }
                         core::ptr::write(base_ptr as *mut usize, size);
                         cache.metrics.maybe_flush();
