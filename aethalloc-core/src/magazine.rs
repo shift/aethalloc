@@ -58,11 +58,14 @@ impl Magazine {
         self.count = 0;
     }
 
+    /// # Safety
+    /// `base` must be a valid pointer to a memory region with at least
+    /// `count * block_size` bytes accessible.
     #[inline]
-    pub fn bulk_init(&mut self, base: *mut u8, block_size: usize, count: usize) {
+    pub unsafe fn bulk_init(&mut self, base: *mut u8, block_size: usize, count: usize) {
         let to_add = count.min(MAGAZINE_CAPACITY - self.count);
         for i in 0..to_add {
-            self.blocks[self.count + i] = unsafe { base.add(i * block_size) };
+            self.blocks[self.count + i] = base.add(i * block_size);
         }
         self.count += to_add;
     }

@@ -88,27 +88,37 @@ nix run .#suricata-aeth
 ## Benchmarks
 
 **Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz, 16 GB RAM  
-**Last updated:** 2026-03-18
+**Last updated:** 2026-03-19
 
-### Summary
+### Summary vs Competitors
 
-| Benchmark | glibc | AethAlloc | Ratio |
-|-----------|-------|-----------|-------|
-| Packet Churn | 238K ops/s | 245K ops/s | **103%** |
-| KV Store | 328K ops/s | 365K ops/s | **111%** |
-| Producer-Consumer | 493K ops/s | 622K ops/s | **126%** |
-| Multithread (8T) | 6.7M ops/s | 6.5M ops/s | **97%** |
-| Fragmentation RSS | 220 MB | 24 MB | **9x better** |
+| Benchmark | AethAlloc | Best Competitor | Notes |
+|-----------|-----------|-----------------|-------|
+| **Micro Burst** (cold start) | 749ns cold, 71ns warm | jemalloc: 201ns cold | Warm is 3x faster than mimalloc |
+| **KV Store** | 281K ops/s, 30.2% overhead | tcmalloc: 359K, 13.3% overhead | Memory overhead needs work |
+| **RSS Reclaim** | **100%** returned | mimalloc: 0% (hoards) | **AethAlloc wins** |
+| **Asymmetric Threads** | 294K ops/s | jemalloc: 309K ops/s | Competitive |
+| **Fragmentation** | 17.4MB RSS growth | glibc: 30.8MB | **AethAlloc wins** |
+| **Packet Churn** | 278K ops/s | tcmalloc: 290K | Competitive |
+
+### Micro Burst (Cold Start Latency)
+
+Tests idle → burst allocation pattern. Measures cold cache vs warm cache performance.
+
+```
+AethAlloc:   749ns (cold), 71ns (warm)
+jemalloc:    201ns (cold)
+mimalloc:    220ns (warm - 3x slower than AethAlloc warm)
+```
 
 ### Packet Churn (Network Processing)
 
 64-byte packet allocations simulating network processing workload.
 
 ```
+AethAlloc:   278K ops/s
+tcmalloc:    290K ops/s (+4%)
 glibc:       238K ops/s
-AethAlloc:   245K ops/s (+3%)
-P50 latency: 3.4 µs
-P99 latency: 7.7 µs
 ```
 
 ### KV Store (Redis-like Workload)
@@ -116,41 +126,39 @@ P99 latency: 7.7 µs
 Variable-sized keys (8-64B) and values (16-64KB) with SET/GET/DEL operations.
 
 ```
+AethAlloc:   281K ops/s, 30.2% memory overhead
+tcmalloc:    359K ops/s, 13.3% overhead
 glibc:       328K ops/s
-AethAlloc:   365K ops/s (+11%)
-SET latency: 3.6 µs
-GET latency: 0.6 µs
-DEL latency: 0.9 µs
 ```
 
-### Producer-Consumer (Cross-Thread Frees)
+### RSS Reclaim (Memory Efficiency)
 
-Thread A allocates, Thread B frees. Simulates network packet handoff.
+Allocates 2GB across multiple threads, then frees all and measures RSS recovery.
 
 ```
+AethAlloc:   100% memory returned to OS
+mimalloc:    0% returned (hoards memory)
+glibc:       100% returned
+```
+
+### Asymmetric Threads (Cross-Thread Frees)
+
+Producer thread allocates, then dies. Consumer thread frees. Simulates network packet handoff.
+
+```
+AethAlloc:   294K ops/s
+jemalloc:    309K ops/s (+5%)
 glibc:       493K ops/s
-AethAlloc:   622K ops/s (+26%)
-Memory:      Stable with anti-hoarding active
-```
-
-### Multithread Churn (8 Threads)
-
-Concurrent allocations (16B - 4KB) across 8 threads with heavy contention.
-
-```
-glibc:       6.7M ops/s
-AethAlloc:   6.5M ops/s (97%)
-Avg latency: 834 ns
 ```
 
 ### Fragmentation (Long-running Server)
 
-Mixed allocation sizes (16B - 1MB) over 1M iterations.
+Mixed allocation sizes (16B - 1MB) over 50K iterations. Measures RSS growth.
 
 ```
-glibc:       220 MB RSS
-AethAlloc:   24 MB RSS (9x better)
-Throughput:  232K ops/s
+AethAlloc:   17.4 MB RSS growth
+glibc:       30.8 MB RSS growth
+AethAlloc is 1.8x better
 ```
 
 ### Tail Latency (P99/P99.9)
