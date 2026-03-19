@@ -49,12 +49,12 @@ AethAlloc is a production-grade memory allocator featuring:
 ## Deployment Targets
 
 ### m720q Gateway (Multi-WAN Routing)
-- **Producer-Consumer**: 622K ops/s (+26% vs glibc)
+- **Producer-Consumer**: 447K ops/s (competitive with all allocators)
+- **Anti-hoarding**: Prevents memory bloat in packet handoff workloads
 - Guarantees line-rate packet inspection
-- Asynchronous SKB payload handoff between NIC and firewall workers
 
 ### X1 Yoga Workstation (Desktop)
-- **Fragmentation RSS**: 24 MB (9x better than glibc)
+- **Fragmentation RSS**: 17 MB (1.8x better than glibc)
 - Prevents memory bloat in long-running desktop environments
 - Preserves NVMe lifespan and battery capacity
 
@@ -87,97 +87,19 @@ nix run .#suricata-aeth
 
 ## Benchmarks
 
-**Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz, 16 GB RAM  
-**Last updated:** 2026-03-19
+**Test System:** Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz, 16 GB RAM
 
-### Summary vs Competitors
+### Quick Summary
 
-| Benchmark | AethAlloc | Best Competitor | Notes |
-|-----------|-----------|-----------------|-------|
-| **Micro Burst** (cold start) | 749ns cold, 71ns warm | jemalloc: 201ns cold | Warm is 3x faster than mimalloc |
-| **KV Store** | 281K ops/s, 30.2% overhead | tcmalloc: 359K, 13.3% overhead | Memory overhead needs work |
-| **RSS Reclaim** | **100%** returned | mimalloc: 0% (hoards) | **AethAlloc wins** |
-| **Asymmetric Threads** | 294K ops/s | jemalloc: 309K ops/s | Competitive |
-| **Fragmentation** | 17.4MB RSS growth | glibc: 30.8MB | **AethAlloc wins** |
-| **Packet Churn** | 278K ops/s | tcmalloc: 290K | Competitive |
+| Benchmark | AethAlloc | Best Competitor | Result |
+|-----------|-----------|-----------------|--------|
+| **Multithread Churn** | 19.4M ops/s | AethAlloc | **WINNER** |
+| **Tail Latency P99** | 106ns | jemalloc: 106ns | **TIED BEST** |
+| **Fragmentation RSS** | 17.0 MB | AethAlloc | **WINNER** (1.8x better) |
+| **Packet Churn** | 252K ops/s | jemalloc: 280K ops/s | -10% |
+| **Producer-Consumer** | 447K ops/s | mimalloc: 463K ops/s | -3% |
 
-### Micro Burst (Cold Start Latency)
-
-Tests idle → burst allocation pattern. Measures cold cache vs warm cache performance.
-
-```
-AethAlloc:   749ns (cold), 71ns (warm)
-jemalloc:    201ns (cold)
-mimalloc:    220ns (warm - 3x slower than AethAlloc warm)
-```
-
-### Packet Churn (Network Processing)
-
-64-byte packet allocations simulating network processing workload.
-
-```
-AethAlloc:   278K ops/s
-tcmalloc:    290K ops/s (+4%)
-glibc:       238K ops/s
-```
-
-### KV Store (Redis-like Workload)
-
-Variable-sized keys (8-64B) and values (16-64KB) with SET/GET/DEL operations.
-
-```
-AethAlloc:   281K ops/s, 30.2% memory overhead
-tcmalloc:    359K ops/s, 13.3% overhead
-glibc:       328K ops/s
-```
-
-### RSS Reclaim (Memory Efficiency)
-
-Allocates 2GB across multiple threads, then frees all and measures RSS recovery.
-
-```
-AethAlloc:   100% memory returned to OS
-mimalloc:    0% returned (hoards memory)
-glibc:       100% returned
-```
-
-### Asymmetric Threads (Cross-Thread Frees)
-
-Producer thread allocates, then dies. Consumer thread frees. Simulates network packet handoff.
-
-```
-AethAlloc:   294K ops/s
-jemalloc:    309K ops/s (+5%)
-glibc:       493K ops/s
-```
-
-### Fragmentation (Long-running Server)
-
-Mixed allocation sizes (16B - 1MB) over 50K iterations. Measures RSS growth.
-
-```
-AethAlloc:   17.4 MB RSS growth
-glibc:       30.8 MB RSS growth
-AethAlloc is 1.8x better
-```
-
-### Tail Latency (P99/P99.9)
-
-80,000 operations across 8 threads measuring per-operation latency.
-
-```
-glibc:       P50=84ns  P99=103ns  P99.9=127ns  P99.99=26µs  Max=2.3ms
-AethAlloc:   P50=93ns  P99=116ns  P99.9=600ns  P99.99=10µs  Max=2.1ms
-```
-
-### Massive Allocations (>1GB)
-
-Huge contiguous allocations with high alignment.
-
-```
-glibc:       256MB, 512MB, 1GB, 1GB@2MB-align, 2GB - all PASS
-AethAlloc:   256MB, 512MB, 1GB, 1GB@2MB-align, 2GB - all PASS
-```
+**See [BENCHMARK.md](BENCHMARK.md) for full methodology, detailed results, and analysis.**
 
 ## Technical Implementation
 
