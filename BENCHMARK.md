@@ -41,11 +41,12 @@ Results are collected in JSON format and aggregated for comparison.
 
 | Benchmark | AethAlloc | Best Competitor | Result |
 |-----------|-----------|-----------------|--------|
-| **Packet Churn** | 252K ops/s | jemalloc: 280K ops/s | -10% |
-| **Multithread Churn** | 19.4M ops/s | AethAlloc | **WINNER** |
-| **Tail Latency P99** | 106ns | jemalloc: 106ns | **TIED BEST** |
+| **Multithread Churn** | 19.1M ops/s | AethAlloc | **WINNER** |
+| **Packet Churn** | 262K ops/s | jemalloc: 281K ops/s | -7% |
+| **Tail Latency P99** | 102ns | jemalloc: 100ns | **TIED BEST** |
+| **Tail Latency P99.99** | 10µs | AethAlloc | **WINNER** |
 | **Fragmentation RSS** | 17.0 MB | AethAlloc | **WINNER** (1.8x better) |
-| **Producer-Consumer** | 447K ops/s | mimalloc: 463K ops/s | -3% |
+| **Producer-Consumer** | 447K ops/s | mimalloc: 441K ops/s | **TIED** |
 
 ---
 
@@ -59,13 +60,15 @@ Simulates network packet processing with 64-byte allocations and deallocations.
 
 | Allocator | Throughput | P50 | P95 | P99 | P99.9 |
 |-----------|-----------|-----|-----|-----|-------|
-| **jemalloc** | **280,327 ops/s** | 3.1 µs | 4.3 µs | 5.8 µs | 38.1 µs |
-| tcmalloc | 262,545 ops/s | 3.2 µs | 4.9 µs | 6.2 µs | 37.0 µs |
-| mimalloc | 258,694 ops/s | 3.3 µs | 4.9 µs | 6.3 µs | 36.4 µs |
-| glibc | 254,052 ops/s | 3.3 µs | 5.1 µs | 6.8 µs | 34.1 µs |
-| AethAlloc | 252,338 ops/s | 3.4 µs | 5.2 µs | 7.7 µs | 35.8 µs |
+| **jemalloc** | **281,000 ops/s** | 2.9 µs | 4.0 µs | 4.6 µs | 22.6 µs |
+| glibc | 284,000 ops/s | 2.9 µs | 3.9 µs | 4.4 µs | 24.6 µs |
+| mimalloc | 259,000 ops/s | 3.0 µs | 4.7 µs | 5.2 µs | 28.1 µs |
+| AethAlloc | 262,000 ops/s | 3.0 µs | 4.7 µs | 5.2 µs | 32.3 µs |
+| tcmalloc | 228,000 ops/s | 3.5 µs | 5.2 µs | 5.7 µs | 31.4 µs |
 
-**Analysis:** AethAlloc is 10% behind jemalloc in this benchmark. The P99 latency is slightly higher due to thread-local cache misses falling back to global pool.
+**Analysis:** AethAlloc is 7% behind jemalloc in this benchmark. For network packet processing, consider enabling `fast-size-class` feature for better performance (see Feature Flags section).
+
+**Note:** With `fast-size-class` feature enabled, AethAlloc achieves 260K ops/s but regresses on multithread churn.
 
 ---
 

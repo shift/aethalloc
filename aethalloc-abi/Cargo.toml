@@ -12,6 +12,7 @@ default = ["magazine-caching"]
 magazine-caching = ["aethalloc-core/magazine"]
 simple-cache = []
 metrics = []
+fast-size-class = []
 
 [dependencies]
 aethalloc-core = { path = "../aethalloc-core" }

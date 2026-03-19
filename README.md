@@ -82,8 +82,21 @@ nix run .#suricata-aeth
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| `simple-cache` | Thread-local free-list per size class | Yes |
-| `magazine-caching` | Hoard-style magazines (experimental) | No |
+| `magazine-caching` | Hoard-style magazines with global pool | Yes |
+| `simple-cache` | Thread-local free-list per size class | No |
+| `fast-size-class` | Optimized size lookup (better packet churn, worse multithread) | No |
+| `metrics` | Enable allocation metrics collection | No |
+
+### Size Class Lookup Trade-off
+
+The `fast-size-class` feature uses `trailing_zeros()` for O(1) size class lookup:
+
+| Mode | Packet Churn | Multithread Churn | Best For |
+|------|--------------|-------------------|----------|
+| Default (match) | 262K ops/s | 19.1M ops/s | General purpose |
+| `fast-size-class` | 260K ops/s | 16.2M ops/s | Network packet processing |
+
+Enable with: `cargo build --release --features fast-size-class`
 
 ## Benchmarks
 
@@ -93,11 +106,12 @@ nix run .#suricata-aeth
 
 | Benchmark | AethAlloc | Best Competitor | Result |
 |-----------|-----------|-----------------|--------|
-| **Multithread Churn** | 19.4M ops/s | AethAlloc | **WINNER** |
-| **Tail Latency P99** | 106ns | jemalloc: 106ns | **TIED BEST** |
+| **Multithread Churn** | 19.7M ops/s | mimalloc: 19.8M ops/s | **#2** (-0.7%) |
+| **Packet Churn** | 309K ops/s | jemalloc: 328K ops/s | **#4** (-6%) |
+| **Tail Latency P99** | 87ns | glibc: 83ns | **#5** (+5%) |
+| **Tail Latency P99.99** | 718ns | AethAlloc | **WINNER** |
 | **Fragmentation RSS** | 17.0 MB | AethAlloc | **WINNER** (1.8x better) |
-| **Packet Churn** | 252K ops/s | jemalloc: 280K ops/s | -10% |
-| **Producer-Consumer** | 447K ops/s | mimalloc: 463K ops/s | -3% |
+| **Producer-Consumer** | 430K ops/s | mimalloc: 441K ops/s | **#2** (-3%) |
 
 **See [BENCHMARK.md](BENCHMARK.md) for full methodology, detailed results, and analysis.**
 

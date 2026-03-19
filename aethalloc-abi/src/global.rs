@@ -231,18 +231,38 @@ impl ThreadMetrics {
     }
 }
 
+// Fast size class lookup using trailing_zeros (better for packet churn)
+#[cfg(feature = "fast-size-class")]
 #[inline(always)]
-fn size_to_class(size: usize) -> Option<usize> {
-    let rounded = round_up_pow2(size).max(16);
-    if rounded > 65536 {
-        return None;
-    }
+fn size_to_class(rounded: usize) -> Option<usize> {
     let tz = rounded.trailing_zeros() as usize;
-    let class = tz.saturating_sub(4);
+    let class = tz.wrapping_sub(4);
     if class < NUM_SIZE_CLASSES {
         Some(class)
     } else {
         None
+    }
+}
+
+// Default size class lookup using match (better for multithread churn)
+#[cfg(not(feature = "fast-size-class"))]
+#[inline]
+fn size_to_class(rounded: usize) -> Option<usize> {
+    match rounded {
+        16 => Some(0),
+        32 => Some(1),
+        64 => Some(2),
+        128 => Some(3),
+        256 => Some(4),
+        512 => Some(5),
+        1024 => Some(6),
+        2048 => Some(7),
+        4096 => Some(8),
+        8192 => Some(9),
+        16384 => Some(10),
+        32768 => Some(11),
+        65536 => Some(12),
+        _ => None,
     }
 }
 
