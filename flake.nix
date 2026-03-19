@@ -84,10 +84,147 @@
           '';
         };
 
+        benchmarkSources = [
+          "packet_churn"
+          "tail_latency"
+          "producer_consumer"
+          "fragmentation"
+          "multithread_churn"
+        ];
+
+        buildBenchmark = name: pkgs.stdenv.mkDerivation {
+          pname = "bench-${name}";
+          version = "0.1.0";
+          src = ./benches;
+          
+          buildPhase = ''
+            gcc -O3 -pthread -o ${name} ${name}.c
+          '';
+          
+          installPhase = ''
+            mkdir -p $out/bin
+            cp ${name} $out/bin/
+          '';
+        };
+
+        benchmarks = pkgs.symlinkJoin {
+          name = "aethalloc-benchmarks";
+          paths = map buildBenchmark benchmarkSources;
+        };
+
+        allocators = {
+          aethalloc = {
+            name = "aethalloc";
+            libPath = "${aethalloc-rs}/lib/libaethalloc.so";
+            description = "AethAlloc - High-performance allocator for network workloads";
+          };
+          mimalloc = {
+            name = "mimalloc";
+            libPath = "${pkgs.mimalloc}/lib/libmimalloc.so";
+            description = "Microsoft mimalloc - General purpose allocator with excellent performance";
+          };
+          jemalloc = {
+            name = "jemalloc";
+            libPath = "${pkgs.jemalloc}/lib/libjemalloc.so.2";
+            description = "jemalloc - General purpose malloc emphasizing fragmentation avoidance";
+          };
+          tcmalloc = {
+            name = "tcmalloc";
+            libPath = "${pkgs.gperftools}/lib/libtcmalloc.so";
+            description = "Google tcmalloc - Thread-caching malloc";
+          };
+          glibc = {
+            name = "glibc";
+            libPath = "";
+            description = "glibc ptmalloc2 - Default Linux allocator";
+          };
+        };
+
+        runBenchmarks = pkgs.writeShellScriptBin "run-alloc-benchmarks" ''
+          set -euo pipefail
+          
+          BENCH_DIR="${benchmarks}/bin"
+          RESULTS_DIR="''${1:-./benchmark-results}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          RUN_DIR="$RESULTS_DIR/$TIMESTAMP"
+          
+          mkdir -p "$RUN_DIR"
+          
+          ITERATIONS=''${ITERATIONS:-100000}
+          THREADS=''${THREADS:-8}
+          WARMUP=''${WARMUP:-10000}
+          
+          echo "Running allocator benchmarks..."
+          echo "Results will be stored in: $RUN_DIR"
+          echo "Iterations: $ITERATIONS, Threads: $THREADS"
+          echo ""
+          
+          get_lib_path() {
+            case "$1" in
+              aethalloc) echo "${aethalloc-rs}/lib/libaethalloc.so" ;;
+              mimalloc)  echo "${pkgs.mimalloc}/lib/libmimalloc.so" ;;
+              jemalloc)  echo "${pkgs.jemalloc}/lib/libjemalloc.so.2" ;;
+              tcmalloc)  echo "${pkgs.gperftools}/lib/libtcmalloc.so" ;;
+              glibc)     echo "" ;;
+            esac
+          }
+          
+          get_benchmark_args() {
+            case "$1" in
+              packet_churn)      echo "$ITERATIONS $WARMUP" ;;
+              tail_latency)      echo "$THREADS $ITERATIONS" ;;
+              producer_consumer) echo "4 4" ;;
+              fragmentation)     echo "$ITERATIONS 100000" ;;
+              multithread_churn) echo "$THREADS $ITERATIONS" ;;
+            esac
+          }
+          
+          run_benchmark() {
+            local bench="$1"
+            local alloc="$2"
+            local lib_path="$3"
+            local args="$4"
+            local output_file="$RUN_DIR/''${bench}_''${alloc}.json"
+            
+            echo -n "Running $bench with $alloc... "
+            
+            if [ -n "$lib_path" ]; then
+              LD_PRELOAD="$lib_path" "$BENCH_DIR/$bench" $args > "$output_file" 2>&1
+            else
+              "$BENCH_DIR/$bench" $args > "$output_file" 2>&1
+            fi
+            
+            echo "done"
+          }
+          
+          ALLOCATORS="aethalloc mimalloc jemalloc tcmalloc glibc"
+          BENCHMARKS="packet_churn tail_latency producer_consumer fragmentation multithread_churn"
+          
+          for bench in $BENCHMARKS; do
+            echo ""
+            echo "=== Benchmark: $bench ==="
+            args=$(get_benchmark_args "$bench")
+            for alloc in $ALLOCATORS; do
+              lib_path=$(get_lib_path "$alloc")
+              run_benchmark "$bench" "$alloc" "$lib_path" "$args"
+            done
+          done
+          
+          echo ""
+          echo "Benchmark results saved to: $RUN_DIR"
+          echo ""
+          echo "Summary:"
+          for f in "$RUN_DIR"/*.json; do
+            echo "  $(basename $f):"
+            cat "$f" | head -1
+          done
+        '';
+
       in {
         packages = {
           default = aethalloc-rs;
           suricata-aeth = withAethAlloc pkgs.suricata;
+          benchmarks = benchmarks;
         };
 
         devShells.default = pkgs.mkShell {
@@ -95,7 +232,33 @@
             rustToolchain
             pkgs.cargo-flamegraph
             pkgs.valgrind
+            pkgs.jq
+            benchmarks
+            runBenchmarks
+            pkgs.mimalloc
+            pkgs.jemalloc
+            pkgs.gperftools
+            pkgs.flamegraph
+            pkgs.valgrind
           ];
+
+          shellHook = ''
+            export AETHALLOC_LIB="${aethalloc-rs}/lib/libaethalloc.so"
+            export MIMALLOC_LIB="${pkgs.mimalloc}/lib/libmimalloc.so"
+            export JEMALLOC_LIB="${pkgs.jemalloc}/lib/libjemalloc.so.2"
+            export TCMALLOC_LIB="${pkgs.gperftools}/lib/libtcmalloc.so"
+            echo "Allocator libraries available:"
+            echo "  AethAlloc: $AETHALLOC_LIB"
+            echo "  mimalloc:  $MIMALLOC_LIB"
+            echo "  jemalloc:  $JEMALLOC_LIB"
+            echo "  tcmalloc:  $TCMALLOC_LIB"
+            echo ""
+            echo "Run benchmarks with: run-alloc-benchmarks [results_dir]"
+            echo "For full comparison: FULL_COMPARISON=1 run-alloc-benchmarks"
+            echo ""
+            echo "Note: snmalloc not available in nixpkgs. Install manually if needed:"
+            echo "  https://github.com/microsoft/snmalloc"
+          '';
         };
       }
     ) // {
