@@ -94,12 +94,12 @@ nix run .#suricata-aeth
 
 | Benchmark | AethAlloc | Best Competitor | Result |
 |-----------|-----------|-----------------|--------|
-| **Multithread Churn** | 19.7M ops/s | mimalloc: 19.8M ops/s | **#2** (-0.7%) |
-| **Packet Churn** | 309K ops/s | jemalloc: 328K ops/s | **#4** (-6%) |
-| **Tail Latency P99** | 87ns | glibc: 83ns | **#5** (+5%) |
-| **Tail Latency P99.99** | 718ns | AethAlloc | **WINNER** |
+| **Multithread Churn** | 17.0M ops/s | AethAlloc | **WINNER** |
+| **Packet Churn** | 205K ops/s | jemalloc: 218K ops/s | **#2** (-6%) |
+| **Tail Latency P99** | 106ns | jemalloc: 106ns | **TIED BEST** |
+| **Tail Latency P99.99** | 27µs | AethAlloc | **WINNER** |
 | **Fragmentation RSS** | 17.0 MB | AethAlloc | **WINNER** (1.8x better) |
-| **Producer-Consumer** | 430K ops/s | mimalloc: 441K ops/s | **#2** (-3%) |
+| **Producer-Consumer** | 447K ops/s | mimalloc: 441K ops/s | **TIED** |
 
 **See [BENCHMARK.md](BENCHMARK.md) for full methodology, detailed results, and analysis.**
 

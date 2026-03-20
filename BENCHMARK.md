@@ -9,14 +9,14 @@ Comprehensive performance comparison against industry-standard memory allocators
 | **CPU** | Intel Core i5-8365U (4 cores, 8 threads) @ 1.60GHz |
 | **RAM** | 16 GB DDR4 |
 | **OS** | NixOS Linux |
-| **Date** | 2026-03-19 |
+| **Date** | 2026-03-20 |
 | **Build** | Release mode, cargo build --release |
 
 ## Allocators Tested
 
 | Allocator | Version | Source |
 |-----------|---------|--------|
-| **AethAlloc** | 0.2.3 | Built from source |
+| **Allocator** | **AethAlloc** | 0.2.4 | Built from source |
 | **glibc** | System | GNU C Library default |
 | **jemalloc** | 5.3.0-unstable-2025-09-12 | nixpkgs |
 | **mimalloc** | 3.1.5 | nixpkgs |
@@ -41,10 +41,10 @@ Results are collected in JSON format and aggregated for comparison.
 
 | Benchmark | AethAlloc | Best Competitor | Result |
 |-----------|-----------|-----------------|--------|
-| **Multithread Churn** | 19.1M ops/s | AethAlloc | **WINNER** |
-| **Packet Churn** | 262K ops/s | jemalloc: 281K ops/s | -7% |
-| **Tail Latency P99** | 102ns | jemalloc: 100ns | **TIED BEST** |
-| **Tail Latency P99.99** | 10µs | AethAlloc | **WINNER** |
+| **Multithread Churn** | 17.0M ops/s | AethAlloc | **WINNER** |
+| **Packet Churn** | 205K ops/s | jemalloc: 218K ops/s | -6% |
+| **Tail Latency P99** | 106ns | jemalloc: 106ns | **TIED BEST** |
+| **Tail Latency P99.99** | 27µs | AethAlloc | **WINNER** |
 | **Fragmentation RSS** | 17.0 MB | AethAlloc | **WINNER** (1.8x better) |
 | **Producer-Consumer** | 447K ops/s | mimalloc: 441K ops/s | **TIED** |
 
@@ -60,11 +60,11 @@ Simulates network packet processing with 64-byte allocations and deallocations.
 
 | Allocator | Throughput | P50 | P95 | P99 | P99.9 |
 |-----------|-----------|-----|-----|-----|-------|
-| **jemalloc** | **281,000 ops/s** | 2.9 µs | 4.0 µs | 4.6 µs | 22.6 µs |
-| glibc | 284,000 ops/s | 2.9 µs | 3.9 µs | 4.4 µs | 24.6 µs |
-| mimalloc | 259,000 ops/s | 3.0 µs | 4.7 µs | 5.2 µs | 28.1 µs |
-| AethAlloc | 262,000 ops/s | 3.0 µs | 4.7 µs | 5.2 µs | 32.3 µs |
-| tcmalloc | 228,000 ops/s | 3.5 µs | 5.2 µs | 5.7 µs | 31.4 µs |
+| **AethAlloc** | **205,000 ops/s** | 4.1 µs | 6.9 µs | 12.8 µs | 60.0 µs |
+| **jemalloc** | **218,000 ops/s** | 3.6 µs | 6.2 µs | 12.1 µs | 58.3 µs |
+| mimalloc | 183,000 ops/s | 4.5 µs | 7.0 µs | 12.7 µs | 53.1 µs |
+| glibc | 144,000 ops/s | 5.1 µs | 10.8 µs | 23.6 µs | 56.4 µs |
+| tcmalloc | 140,000 ops/s | 5.6 µs | 11.9 µs | 24.5 µs | 58.5 µs |
 
 **Analysis:** AethAlloc is competitive in this benchmark with excellent tail latency characteristics.
 
@@ -74,13 +74,13 @@ Simulates network packet processing with 64-byte allocations and deallocations.
 
 Concurrent allocations across 4 threads with mixed sizes (16B - 4KB).
 
-**Parameters:** 4 threads, 2,000,000 total operations
+**Parameters:** 8 threads, 800,000 total operations
 
 | Allocator | Throughput | Avg Latency |
 |-----------|-----------|-------------|
-| **AethAlloc** | **19,364,456 ops/s** | 116 ns |
-| jemalloc | 19,044,014 ops/s | 119 ns |
-| mimalloc | 18,230,854 ops/s | 120 ns |
+| **AethAlloc** | **17,000,000 ops/s** | 248 ns |
+| mimalloc | 15,000,000 ops/s | 263 ns |
+| jemalloc | 9,200,000 ops/s | 193 ns |
 | tcmalloc | 17,001,852 ops/s | 126 ns |
 | glibc | 16,899,323 ops/s | 125 ns |
 
@@ -200,4 +200,4 @@ All benchmarks are in `benches/`:
 
 | Date | Version | Notes |
 |------|---------|-------|
-| 2026-03-19 | 0.2.3 | Full benchmark suite vs competitors |
+| 2026-03-20 | 0.2.4 | Removed trailing_zeros regression, match-based size_to_class |
