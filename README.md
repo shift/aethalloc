@@ -84,19 +84,7 @@ nix run .#suricata-aeth
 |---------|-------------|---------|
 | `magazine-caching` | Hoard-style magazines with global pool | Yes |
 | `simple-cache` | Thread-local free-list per size class | No |
-| `fast-size-class` | Optimized size lookup (better packet churn, worse multithread) | No |
 | `metrics` | Enable allocation metrics collection | No |
-
-### Size Class Lookup Trade-off
-
-The `fast-size-class` feature uses `trailing_zeros()` for O(1) size class lookup:
-
-| Mode | Packet Churn | Multithread Churn | Best For |
-|------|--------------|-------------------|----------|
-| Default (match) | 262K ops/s | 19.1M ops/s | General purpose |
-| `fast-size-class` | 260K ops/s | 16.2M ops/s | Network packet processing |
-
-Enable with: `cargo build --release --features fast-size-class`
 
 ## Benchmarks
 

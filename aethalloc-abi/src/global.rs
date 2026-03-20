@@ -1,8 +1,8 @@
 //! Global allocator implementation with thread-local caching
 //!
 //! Two modes available via feature flags:
-//! - simple-cache (default): Thread-local free-list per size class
-//! - magazine-caching: Hoard-style magazines for cross-thread transfers
+//! - magazine-caching (default): Hoard-style magazines for cross-thread transfers
+//! - simple-cache: Thread-local free-list per size class
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
@@ -231,23 +231,9 @@ impl ThreadMetrics {
     }
 }
 
-// Fast size class lookup using trailing_zeros (better for packet churn)
-#[cfg(feature = "fast-size-class")]
-#[inline(always)]
-fn size_to_class(rounded: usize) -> Option<usize> {
-    let tz = rounded.trailing_zeros() as usize;
-    let class = tz.wrapping_sub(4);
-    if class < NUM_SIZE_CLASSES {
-        Some(class)
-    } else {
-        None
-    }
-}
-
-// Default size class lookup using match (better for multithread churn)
-#[cfg(not(feature = "fast-size-class"))]
 #[inline]
-fn size_to_class(rounded: usize) -> Option<usize> {
+fn size_to_class(size: usize) -> Option<usize> {
+    let rounded = round_up_pow2(size).max(16);
     match rounded {
         16 => Some(0),
         32 => Some(1),

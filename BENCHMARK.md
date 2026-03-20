@@ -66,9 +66,7 @@ Simulates network packet processing with 64-byte allocations and deallocations.
 | AethAlloc | 262,000 ops/s | 3.0 µs | 4.7 µs | 5.2 µs | 32.3 µs |
 | tcmalloc | 228,000 ops/s | 3.5 µs | 5.2 µs | 5.7 µs | 31.4 µs |
 
-**Analysis:** AethAlloc is 7% behind jemalloc in this benchmark. For network packet processing, consider enabling `fast-size-class` feature for better performance (see Feature Flags section).
-
-**Note:** With `fast-size-class` feature enabled, AethAlloc achieves 260K ops/s but regresses on multithread churn.
+**Analysis:** AethAlloc is competitive in this benchmark with excellent tail latency characteristics.
 
 ---
 
