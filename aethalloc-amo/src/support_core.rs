@@ -49,8 +49,7 @@ impl<const N: usize> SupportCore<N> {
     }
 
     pub fn run(&mut self) {
-        const MAX_SPINS: u32 = 64;
-        const PARK_DURATION: Duration = Duration::from_micros(100);
+        const PARK_DURATION: Duration = Duration::from_micros(500);
 
         while self.running {
             if let Some(entry) = self.ring_buffer.try_pop() {
@@ -58,21 +57,13 @@ impl<const N: usize> SupportCore<N> {
                 self.handle_command(entry);
             } else {
                 self.idle_count += 1;
-
-                if self.idle_count < 16 {
-                    core::hint::spin_loop();
-                } else if self.idle_count < MAX_SPINS {
-                    #[cfg(feature = "std")]
-                    thread::yield_now();
-                } else {
-                    #[cfg(feature = "std")]
-                    {
-                        self.stats.idle_parks += 1;
-                        thread::sleep(PARK_DURATION);
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        self.idle_count = MAX_SPINS / 2;
+                self.stats.idle_parks += 1;
+                #[cfg(feature = "std")]
+                thread::sleep(PARK_DURATION);
+                #[cfg(not(feature = "std"))]
+                {
+                    for _ in 0..1000 {
+                        core::hint::spin_loop();
                     }
                 }
             }

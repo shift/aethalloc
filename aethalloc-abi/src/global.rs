@@ -602,8 +602,15 @@ unsafe impl GlobalAlloc for AethAlloc {
             if page_header.magic == MAGIC && page_header.num_pages > 0 {
                 let size = page_header.num_pages as usize * PAGE_SIZE;
                 let base_ptr_nn = NonNull::new_unchecked(base_ptr);
-                use aethalloc_core::try_compact_region;
-                let _compacted = try_compact_region(base_ptr_nn, size);
+                #[cfg(feature = "vmpc")]
+                {
+                    use aethalloc_core::try_compact_region;
+                    let _compacted = try_compact_region(base_ptr_nn, size);
+                }
+                #[cfg(not(feature = "vmpc"))]
+                {
+                    let _ = (base_ptr_nn, size);
+                }
                 PageAllocator::dealloc(base_ptr_nn, page_header.num_pages as usize);
             }
             let cache = get_thread_cache();
@@ -781,8 +788,15 @@ unsafe impl GlobalAlloc for AethAlloc {
             if page_header.magic == MAGIC && page_header.num_pages > 0 {
                 let size = page_header.num_pages as usize * PAGE_SIZE;
                 let base_ptr_nn = NonNull::new_unchecked(base_ptr);
-                use aethalloc_core::try_compact_region;
-                let _compacted = try_compact_region(base_ptr_nn, size);
+                #[cfg(feature = "vmpc")]
+                {
+                    use aethalloc_core::try_compact_region;
+                    let _compacted = try_compact_region(base_ptr_nn, size);
+                }
+                #[cfg(not(feature = "vmpc"))]
+                {
+                    let _ = (base_ptr_nn, size);
+                }
                 PageAllocator::dealloc(base_ptr_nn, page_header.num_pages as usize);
             }
             let cache = get_thread_cache();
