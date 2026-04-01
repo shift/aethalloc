@@ -81,9 +81,9 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
         return ptr;
     }
 
-    // For large allocations, try mremap without MAYMOVE first (fast path:
-    // only succeeds if adjacent virtual memory is available). If that fails,
-    // fall back to malloc+memcpy+free.
+    // For large allocations, use mremap. Even with MAYMOVE (which always moves
+    // for mmap-based allocations), mremap is faster than malloc+memcpy+free
+    // because the kernel just remaps page tables instead of copying memory.
     if old_size > global::MAX_CACHE_SIZE {
         let large_header_addr =
             unsafe { ptr.sub(global::LARGE_HEADER_SIZE) as *const global::LargeAllocHeader };
@@ -95,17 +95,15 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
                 let new_pages = min_size.div_ceil(global::PAGE_SIZE).max(1) as u32;
                 let old_byte_len = page_header.num_pages as usize * global::PAGE_SIZE;
                 let new_byte_len = new_pages as usize * global::PAGE_SIZE;
-                // Try in-place first (no MAYMOVE = only succeeds if adjacent VM is free)
                 let result = unsafe {
                     libc::mremap(
                         base_ptr as *mut libc::c_void,
                         old_byte_len,
                         new_byte_len,
-                        0, // No MREMAP_MAYMOVE - fast fail if can't expand in place
+                        libc::MREMAP_MAYMOVE,
                     )
                 };
                 if result != libc::MAP_FAILED {
-                    // Successfully expanded in place - update headers
                     let new_header_ptr = result as *mut global::PageHeader;
                     unsafe {
                         core::ptr::write(
@@ -118,7 +116,23 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
                             },
                         );
                     }
-                    return ptr; // Same pointer, just expanded
+                    let new_base = result as *mut u8;
+                    let new_user_addr = global::AethAlloc::align_up(
+                        new_base as usize + global::PAGE_HEADER_SIZE + global::LARGE_HEADER_SIZE,
+                        8,
+                    );
+                    let new_large_header = global::LargeAllocHeader {
+                        magic: global::LARGE_MAGIC,
+                        base_ptr: new_base,
+                    };
+                    unsafe {
+                        core::ptr::write(
+                            (new_user_addr - global::LARGE_HEADER_SIZE)
+                                as *mut global::LargeAllocHeader,
+                            new_large_header,
+                        );
+                    }
+                    return new_user_addr as *mut u8;
                 }
             }
         }
