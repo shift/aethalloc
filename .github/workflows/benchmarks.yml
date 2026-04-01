@@ -224,9 +224,9 @@ jobs:
                   except Exception as e:
                       print(f"WARNING: aethalloc {bench_name} run {i+1} failed: {e}")
 
-              g_mean = statistics.mean(glibc_vals)
+              g_mean = statistics.mean(glibc_vals) if glibc_vals else 0
               g_stdev = statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0
-              a_mean = statistics.mean(aeth_vals)
+              a_mean = statistics.mean(aeth_vals) if aeth_vals else 0
               a_stdev = statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0
               delta = ((a_mean - g_mean) / g_mean * 100) if g_mean > 0 else 0
 
@@ -236,9 +236,12 @@ jobs:
                   emoji = "🟢" if delta < -2 else "🔴" if delta > 2 else "➖"
 
               summary += f"{emoji} **{bench_name}**\n"
-              summary += f"- glibc: {g_mean:,.0f} ± {g_stdev:,.0f} {unit}\n"
-              summary += f"- aethalloc: {a_mean:,.0f} ± {a_stdev:,.0f} {unit}\n"
-              summary += f"- **delta: {delta:+.1f}%**\n\n"
+              if glibc_vals or aeth_vals:
+                  summary += f"- glibc: {g_mean:,.0f} ± {g_stdev:,.0f} {unit}\n"
+                  summary += f"- aethalloc: {a_mean:,.0f} ± {a_stdev:,.0f} {unit}\n"
+                  summary += f"- **delta: {delta:+.1f}%**\n\n"
+              else:
+                  summary += f"- ⚠️ All runs failed (benchmark may not work on this platform)\n\n"
 
           # Tail latency
           summary += "---\n\n## Tail Latency (8 threads, 50K ops)\n\n"
@@ -246,10 +249,14 @@ jobs:
           summary += "|-----------|-----|-----|-------|--------|-----|\n"
 
           for label, pre in [("glibc", ""), ("AethAlloc", f"LD_PRELOAD={LIB_PATH}")]:
-              out = subprocess.check_output(f"{pre} /tmp/tail_latency 8 50000", shell=True, stderr=subprocess.STDOUT).decode()
-              d = json.loads(out.strip())
-              lat = d.get("latency_ns", {})
-              summary += f"| {label} | {lat.get('p50', 0):,.0f}ns | {lat.get('p99', 0):,.0f}ns | {lat.get('p99.9', 0):,.0f}ns | {lat.get('p99.99', 0):,.0f}ns | {lat.get('max', 0):,.0f}ns |\n"
+              try:
+                  out = subprocess.check_output(f"{pre} /tmp/tail_latency 8 50000", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                  d = json.loads(out.strip())
+                  lat = d.get("latency_ns", {})
+                  summary += f"| {label} | {lat.get('p50', 0):,.0f}ns | {lat.get('p99', 0):,.0f}ns | {lat.get('p99.9', 0):,.0f}ns | {lat.get('p99.99', 0):,.0f}ns | {lat.get('max', 0):,.0f}ns |\n"
+              except Exception as e:
+                  summary += f"| {label} | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |\n"
+                  print(f"WARNING: {label} tail_latency failed: {e}")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
               f.write(summary)
