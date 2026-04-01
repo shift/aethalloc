@@ -9,9 +9,14 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-std = []
+std = ["dep:libc"]
+hess = ["dep:aethalloc-hess"]
+vmpc = ["dep:aethalloc-vmpc"]
 
 [dependencies]
+aethalloc-hess = { path = "../aethalloc-hess", optional = true }
+aethalloc-vmpc = { path = "../aethalloc-vmpc", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

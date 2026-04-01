@@ -1,11 +1,8 @@
 //! AethAlloc ABI - C-compatible allocator interface for LD_PRELOAD injection
 
 #![feature(thread_local)]
-#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-
-#[cfg(test)]
 extern crate std;
 
 use alloc::alloc::{GlobalAlloc, Layout};
@@ -22,6 +19,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 fn ensure_init() {
     if !INITIALIZED.load(Ordering::Acquire) {
         INITIALIZED.store(true, Ordering::Release);
+        global::ensure_support_core();
     }
 }
 
@@ -75,12 +73,62 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     }
 
     let old_size = unsafe { global::get_alloc_size(ptr) };
+    if old_size == 0 {
+        return ptr::null_mut();
+    }
 
+    if size <= old_size {
+        return ptr;
+    }
+
+    // For large allocations, try mremap without MAYMOVE first (fast path:
+    // only succeeds if adjacent virtual memory is available). If that fails,
+    // fall back to malloc+memcpy+free.
+    if old_size > global::MAX_CACHE_SIZE {
+        let large_header_addr =
+            unsafe { ptr.sub(global::LARGE_HEADER_SIZE) as *const global::LargeAllocHeader };
+        if unsafe { core::ptr::read(large_header_addr).magic } == global::LARGE_MAGIC {
+            let base_ptr = unsafe { core::ptr::read(large_header_addr).base_ptr };
+            let page_header = unsafe { core::ptr::read(base_ptr as *const global::PageHeader) };
+            if page_header.magic == global::MAGIC {
+                let min_size = global::PAGE_HEADER_SIZE + global::LARGE_HEADER_SIZE + size + 8;
+                let new_pages = min_size.div_ceil(global::PAGE_SIZE).max(1) as u32;
+                let old_byte_len = page_header.num_pages as usize * global::PAGE_SIZE;
+                let new_byte_len = new_pages as usize * global::PAGE_SIZE;
+                // Try in-place first (no MAYMOVE = only succeeds if adjacent VM is free)
+                let result = unsafe {
+                    libc::mremap(
+                        base_ptr as *mut libc::c_void,
+                        old_byte_len,
+                        new_byte_len,
+                        0, // No MREMAP_MAYMOVE - fast fail if can't expand in place
+                    )
+                };
+                if result != libc::MAP_FAILED {
+                    // Successfully expanded in place - update headers
+                    let new_header_ptr = result as *mut global::PageHeader;
+                    unsafe {
+                        core::ptr::write(
+                            new_header_ptr,
+                            global::PageHeader {
+                                magic: global::MAGIC,
+                                num_pages: new_pages,
+                                requested_size: size,
+                                tag: page_header.tag,
+                            },
+                        );
+                    }
+                    return ptr; // Same pointer, just expanded
+                }
+            }
+        }
+    }
+
+    // Fallback: malloc + memcpy + free
     let new_ptr = malloc(size);
     if !new_ptr.is_null() {
-        let copy_size = old_size.min(size);
         unsafe {
-            core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
         }
         free(ptr);
     }
@@ -119,10 +167,4 @@ pub extern "C" fn posix_memalign(memptr: *mut *mut u8, alignment: usize, size: u
         *memptr = ptr;
     }
     0
-}
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }

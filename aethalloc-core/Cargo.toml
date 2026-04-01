@@ -16,6 +16,12 @@ buddy = []
 thread-local = []
 aethalloc-audit = []
 magazine = []
+hess = ["dep:aethalloc-hess"]
+mte = ["hess", "aethalloc-hess/aethalloc-mte"]
+cheri = ["hess", "aethalloc-hess/aethalloc-cheri"]
+vmpc = ["dep:aethalloc-vmpc"]
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
+aethalloc-hess = { path = "../aethalloc-hess", optional = true }
+aethalloc-vmpc = { path = "../aethalloc-vmpc", optional = true }
