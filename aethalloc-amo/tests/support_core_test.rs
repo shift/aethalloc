@@ -1,6 +1,6 @@
 //! Integration test for ring buffer + support core
 //!
-//! Tests the full AMO pipeline with concurrent producer/consumer.
+//! Tests the full AMO pipelines with concurrent producer/consumer.
 
 #![cfg(feature = "std")]
 
@@ -42,9 +42,11 @@ fn test_producer_consumer_threads() {
 
     let producer = thread::spawn(move || {
         for i in 0..100 {
+            // Allocate real memory so support_core can free it safely
+            let ptr = unsafe { libc::malloc(16) as *mut u8 };
             let payload = FreeBlockPayload {
-                ptr: i as *mut u8,
-                size: i * 16,
+                ptr,
+                size: 16,
                 size_class: (i % 16) as u8,
             };
             let entry = RingEntry::new(
@@ -60,7 +62,7 @@ fn test_producer_consumer_threads() {
     });
 
     producer.join().unwrap();
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(100));
 
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     consumer.join().unwrap();
