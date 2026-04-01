@@ -850,6 +850,16 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
     if ptr.is_null() {
         return 0;
     }
+    // Fast path: check cache header first (most common for small allocs)
+    let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
+    let maybe_size = core::ptr::read(size_ptr);
+    if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
+        let potential_header = size_ptr as *mut PageHeader;
+        if core::ptr::read(potential_header).magic != MAGIC {
+            return maybe_size;
+        }
+    }
+    // Slow path: check large allocation header
     let large_header_addr = ptr.sub(LARGE_HEADER_SIZE) as *const LargeAllocHeader;
     if core::ptr::read(large_header_addr).magic == LARGE_MAGIC {
         let base_ptr = core::ptr::read(large_header_addr).base_ptr;
@@ -859,14 +869,7 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
         }
         return 0;
     }
-    let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
-    let maybe_size = core::ptr::read(size_ptr);
-    if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
-        let potential_header = size_ptr as *mut PageHeader;
-        if core::ptr::read(potential_header).magic != MAGIC {
-            return maybe_size;
-        }
-    }
+    // Fallback: page header lookup
     let header = AethAlloc::page_header_from_ptr(ptr);
     let header_ref = core::ptr::read(header);
     if header_ref.magic == MAGIC {
