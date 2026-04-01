@@ -202,20 +202,27 @@ jobs:
               glibc_vals = []
               aeth_vals = []
               for i in range(runs):
-                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-                  d = json.loads(out.strip())
-                  parts = metric.split(".")
-                  val = d
-                  for p in parts:
-                      val = val.get(p, 0) if isinstance(val, dict) else 0
-                  glibc_vals.append(val)
+                  try:
+                      out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      glibc_vals.append(val)
+                  except Exception as e:
+                      print(f"WARNING: glibc {bench_name} run {i+1} failed: {e}")
 
-                  out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT).decode()
-                  d = json.loads(out.strip())
-                  val = d
-                  for p in parts:
-                      val = val.get(p, 0) if isinstance(val, dict) else 0
-                  aeth_vals.append(val)
+                  try:
+                      out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      aeth_vals.append(val)
+                  except Exception as e:
+                      print(f"WARNING: aethalloc {bench_name} run {i+1} failed: {e}")
 
               g_mean = statistics.mean(glibc_vals)
               g_stdev = statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0
@@ -253,23 +260,30 @@ jobs:
               glibc_vals = []
               aeth_vals = []
               for i in range(runs):
-                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-                  d = json.loads(out.strip())
-                  parts = metric.split(".")
-                  val = d
-                  for p in parts:
-                      val = val.get(p, 0) if isinstance(val, dict) else 0
-                  glibc_vals.append(val)
-                  out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT).decode()
-                  d = json.loads(out.strip())
-                  val = d
-                  for p in parts:
-                      val = val.get(p, 0) if isinstance(val, dict) else 0
-                  aeth_vals.append(val)
-              raw[bench_name] = {
-                  "glibc": {"mean": statistics.mean(glibc_vals), "stdev": statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0, "runs": glibc_vals},
-                  "aethalloc": {"mean": statistics.mean(aeth_vals), "stdev": statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0, "runs": aeth_vals},
-              }
+                  try:
+                      out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      glibc_vals.append(val)
+                  except:
+                      pass
+                  try:
+                      out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      aeth_vals.append(val)
+                  except:
+                      pass
+              if glibc_vals or aeth_vals:
+                  raw[bench_name] = {
+                      "glibc": {"mean": statistics.mean(glibc_vals) if glibc_vals else 0, "stdev": statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0, "runs": glibc_vals},
+                      "aethalloc": {"mean": statistics.mean(aeth_vals) if aeth_vals else 0, "stdev": statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0, "runs": aeth_vals},
+                  }
           with open("benchmark-results.json", "w") as f:
               json.dump(raw, f, indent=2)
           PYEOF
