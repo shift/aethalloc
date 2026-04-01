@@ -4,13 +4,6 @@ on:
   push:
     branches: [feature/wire-advanced-features]
   workflow_dispatch:
-    inputs:
-      runs:
-        description: 'Number of runs per benchmark'
-        required: false
-        default: '5'
-        type: choice
-        options: ['3', '5', '10']
 
 jobs:
   build:
@@ -39,22 +32,12 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
-      - name: Build default
+      - name: Build
         run: nix build
-      - name: Build with metrics
-        run: nix build .#aethalloc-abi-metrics 2>/dev/null || nix build --arg features '["metrics"]' 2>/dev/null || echo "metrics build skipped"
-      - name: Build with vmpc
-        run: nix build --arg features '["vmpc"]' 2>/dev/null || echo "vmpc build skipped"
-      - name: Upload default artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libaethalloc-default
-          path: result/lib/*.so
-      - name: Upload metrics artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: libaethalloc-metrics
+          name: libaethalloc
           path: result/lib/*.so
 
   benchmark-matrix:
@@ -63,54 +46,55 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [default, metrics, vmpc]
         benchmark:
           - name: packet_churn
-            cmd: /tmp/packet_churn 100000 10000
+            cmd: "/tmp/packet_churn 100000 10000"
             metric: throughput_ops_per_sec
-            higher: better
+            unit: ops/s
+            direction: higher
           - name: multithread_churn
-            cmd: /tmp/multithread_churn 8 100000
+            cmd: "/tmp/multithread_churn 8 100000"
             metric: throughput_ops_per_sec
-            higher: better
-          - name: realloc_churn
-            cmd: /tmp/realloc_churn 100000 2
-            metric: latency_ns.avg
-            higher: worse
-          - name: realloc_large
-            cmd: /tmp/realloc_large 10000
-            metric: latency_ns.avg
-            higher: worse
-          - name: fragmentation_churn
-            cmd: /tmp/fragmentation_churn 50000 10000
-            metric: latency_ns.avg
-            higher: worse
+            unit: ops/s
+            direction: higher
           - name: kv_store
-            cmd: /tmp/kv_store
+            cmd: "/tmp/kv_store"
             metric: throughput_ops_per_sec
-            higher: better
+            unit: ops/s
+            direction: higher
           - name: producer_consumer
-            cmd: /tmp/producer_consumer
+            cmd: "/tmp/producer_consumer"
             metric: throughput_ops_per_sec
-            higher: better
-          - name: fragmentation
-            cmd: /tmp/fragmentation
+            unit: ops/s
+            direction: higher
+          - name: realloc_churn
+            cmd: "/tmp/realloc_churn 100000 2"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: realloc_large
+            cmd: "/tmp/realloc_large 10000"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: fragmentation_churn
+            cmd: "/tmp/fragmentation_churn 50000 10000"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: fragmentation_rss
+            cmd: "/tmp/fragmentation"
             metric: summary.final_rss_kb
-            higher: worse
-        runs: [1, 2, 3, 4, 5]
+            unit: KB
+            direction: lower
+        run_id: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
-      - name: Download default artifact
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: libaethalloc-default
+          name: libaethalloc
           path: ./lib
-      - name: Download metrics artifact
-        if: matrix.feature == 'metrics'
-        uses: actions/download-artifact@v4
-        with:
-          name: libaethalloc-metrics
-          path: ./lib-metrics
       - name: Compile benchmarks
         run: |
           gcc -O3 -pthread benches/packet_churn.c -o /tmp/packet_churn
@@ -125,23 +109,24 @@ jobs:
         id: glibc
         run: |
           RESULT=$(${{ matrix.benchmark.cmd }} 2>&1)
-          echo "result=$RESULT" >> $GITHUB_OUTPUT
-      - name: Run aethalloc (${{ matrix.feature }})
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Run aethalloc
         id: aethalloc
         run: |
           LIB=$(realpath lib/*.so)
           RESULT=$(LD_PRELOAD="$LIB" ${{ matrix.benchmark.cmd }} 2>&1)
-          echo "result=$RESULT" >> $GITHUB_OUTPUT
-      - name: Compare and output
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Compare
         run: |
-          python3 << 'PYEOF'
-          import json, sys
-
-          glibc = json.loads("""${{ steps.glibc.outputs.result }}""")
-          aeth = json.loads("""${{ steps.aethalloc.outputs.result }}""")
-
-          metric_path = "${{ matrix.benchmark.metric }}".split(".")
-          
+          python3 -c "
+          import json, os
+          glibc = json.loads(os.environ['GLIBC_RESULT'])
+          aeth = json.loads(os.environ['AETH_RESULT'])
+          metric_path = os.environ['METRIC'].split('.')
           def get_nested(d, path):
               for key in path:
                   if isinstance(d, dict):
@@ -149,25 +134,23 @@ jobs:
                   else:
                       return 0
               return d
-
           glibc_val = get_nested(glibc, metric_path)
           aeth_val = get_nested(aeth, metric_path)
-
-          if glibc_val > 0:
-              delta = ((aeth_val - glibc_val) / glibc_val) * 100
+          delta = ((aeth_val - glibc_val) / glibc_val * 100) if glibc_val > 0 else 0
+          direction = os.environ['DIRECTION']
+          if direction == 'higher':
+              emoji = '🟢' if delta > 0 else '🔴' if delta < 0 else '➖'
           else:
-              delta = 0
-
-          emoji = "🟢" if delta > 0 and "${{ matrix.benchmark.higher }}" == "better" else ""
-          emoji = "🔴" if delta < 0 and "${{ matrix.benchmark.higher }}" == "better" else emoji
-          emoji = "🟢" if delta < 0 and "${{ matrix.benchmark.higher }}" == "worse" else emoji
-          emoji = "🔴" if delta > 0 and "${{ matrix.benchmark.higher }}" == "worse" else emoji
-
-          print(f"## {emoji} {matrix.benchmark.name} (run ${{{{ matrix.runs }}}}, ${{{{ matrix.feature }}}})")
-          print(f"- **glibc**: {glibc_val:,.2f}")
-          print(f"- **aethalloc**: {aeth_val:,.2f}")
-          print(f"- **delta**: {delta:+.1f}%")
-          PYEOF
+              emoji = '🟢' if delta < 0 else '🔴' if delta > 0 else '➖'
+          print(f'{emoji} {os.environ[\"BENCH_NAME\"]} run {os.environ[\"RUN_ID\"]}: glibc={glibc_val:,.2f} | aethalloc={aeth_val:,.2f} | delta={delta:+.1f}%')
+          "
+        env:
+          GLIBC_RESULT: ${{ steps.glibc.outputs.result }}
+          AETH_RESULT: ${{ steps.aethalloc.outputs.result }}
+          METRIC: ${{ matrix.benchmark.metric }}
+          DIRECTION: ${{ matrix.benchmark.direction }}
+          BENCH_NAME: ${{ matrix.benchmark.name }}
+          RUN_ID: ${{ matrix.run_id }}
 
   summarize:
     needs: benchmark-matrix
@@ -175,10 +158,10 @@ jobs:
     if: always()
     steps:
       - uses: actions/checkout@v4
-      - name: Download default artifact
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: libaethalloc-default
+          name: libaethalloc
           path: ./lib
       - name: Compile all benchmarks
         run: |
@@ -191,138 +174,12 @@ jobs:
           gcc -O3 -pthread benches/realloc_large.c -o /tmp/realloc_large
           gcc -O3 -pthread benches/fragmentation_churn.c -o /tmp/fragmentation_churn
           gcc -O3 benches/tail_latency.c -o /tmp/tail_latency
-      - name: Run full matrix (5 runs each, 3 feature configs)
+      - name: Run full benchmark suite
         run: |
           python3 << 'PYEOF'
           import subprocess, json, statistics, os
 
-          LIB = os.path.abspath("lib") + "/*.so"
-          LIB_PATH = subprocess.check_output(f"realpath {LIB}", shell=True).decode().strip()
-
-          benchmarks = [
-              ("packet_churn", "/tmp/packet_churn 100000 10000", "throughput_ops_per_sec", "ops/s"),
-              ("multithread_churn", "/tmp/multithread_churn 8 100000", "throughput_ops_per_sec", "ops/s"),
-              ("kv_store", "/tmp/kv_store", "throughput_ops_per_sec", "ops/s"),
-              ("producer_consumer", "/tmp/producer_consumer", "throughput_ops_per_sec", "ops/s"),
-              ("realloc_churn", "/tmp/realloc_churn 100000 2", "latency_ns.avg", "ns"),
-              ("realloc_large", "/tmp/realloc_large 10000", "latency_ns.avg", "ns"),
-              ("fragmentation_churn", "/tmp/fragmentation_churn 50000 10000", "latency_ns.avg", "ns"),
-              ("fragmentation_rss", "/tmp/fragmentation", "summary.final_rss_kb", "KB"),
-          ]
-
-          features = {
-              "default": LIB_PATH,
-          }
-
-          runs = 5
-          results = {}
-
-          for bench_name, cmd, metric, unit in benchmarks:
-              results[bench_name] = {}
-              
-              # glibc baseline
-              glibc_vals = []
-              for i in range(runs):
-                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-                  d = json.loads(out.strip())
-                  parts = metric.split(".")
-                  val = d
-                  for p in parts:
-                      val = val.get(p, 0) if isinstance(val, dict) else 0
-                  glibc_vals.append(val)
-              
-              results[bench_name]["glibc"] = {
-                  "mean": statistics.mean(glibc_vals),
-                  "stdev": statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0,
-                  "unit": unit,
-              }
-
-              # aethalloc with each feature
-              for feat, lib_path in features.items():
-                  aeth_vals = []
-                  for i in range(runs):
-                      out = subprocess.check_output(f"LD_PRELOAD={lib_path} {cmd}", shell=True, stderr=subprocess.STDOUT).decode()
-                      d = json.loads(out.strip())
-                      parts = metric.split(".")
-                      val = d
-                      for p in parts:
-                          val = val.get(p, 0) if isinstance(val, dict) else 0
-                      aeth_vals.append(val)
-                  
-                  glibc_mean = results[bench_name]["glibc"]["mean"]
-                  aeth_mean = statistics.mean(aeth_vals)
-                  delta = ((aeth_mean - glibc_mean) / glibc_mean * 100) if glibc_mean > 0 else 0
-                  
-                  results[bench_name][feat] = {
-                      "mean": aeth_mean,
-                      "stdev": statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0,
-                      "delta": delta,
-                      "unit": unit,
-                  }
-
-          # Output markdown summary
-          print("# Benchmark Results")
-          print(f"\n**System:** GitHub Actions ubuntu-latest ({subprocess.check_output('nproc', shell=True).decode().strip()} cores)")
-          print(f"**Runs per benchmark:** {runs}")
-          print(f"**Date:** {subprocess.check_output('date -I', shell=True).decode().strip()}")
-          print()
-
-          # Throughput table
-          print("## Throughput (higher is better)")
-          print()
-          print("| Benchmark | glibc | AethAlloc (default) | Delta |")
-          print("|-----------|-------|---------------------|-------|")
-          for bench_name, cmd, metric, unit in benchmarks:
-              if "ops/s" in unit or "KB" in unit:
-                  r = results[bench_name]
-                  g = r["glibc"]
-                  a = r.get("default", {})
-                  delta = a.get("delta", 0)
-                  emoji = "🟢" if delta > 0 else "🔴" if delta < 0 else "➖"
-                  print(f"| {bench_name} | {g['mean']:,.0f} {unit} | {a.get('mean', 0):,.0f} {unit} | {emoji} {delta:+.1f}% |")
-
-          print()
-          print("## Latency (lower is better)")
-          print()
-          print("| Benchmark | glibc | AethAlloc (default) | Delta |")
-          print("|-----------|-------|---------------------|-------|")
-          for bench_name, cmd, metric, unit in benchmarks:
-              if "ns" in unit:
-                  r = results[bench_name]
-                  g = r["glibc"]
-                  a = r.get("default", {})
-                  delta = a.get("delta", 0)
-                  emoji = "🟢" if delta < 0 else "🔴" if delta > 0 else "➖"
-                  print(f"| {bench_name} | {g['mean']:.1f} {unit} | {a.get('mean', 0):.1f} {unit} | {emoji} {delta:+.1f}% |")
-
-          print()
-          print("## Tail Latency (8 threads, 50K ops)")
-          print()
-          print("| Allocator | P50 | P99 | P99.9 | P99.99 | Max |")
-          print("|-----------|-----|-----|-------|--------|-----|")
-          
-          for label, pre in [("glibc", ""), ("AethAlloc", f"LD_PRELOAD={LIB_PATH}")]:
-              out = subprocess.check_output(f"{pre} /tmp/tail_latency 8 50000", shell=True, stderr=subprocess.STDOUT).decode()
-              d = json.loads(out.strip())
-              lat = d.get("latency_ns", {})
-              print(f"| {label} | {lat.get('p50', 0):.0f}ns | {lat.get('p99', 0):.0f}ns | {lat.get('p99.9', 0):.0f}ns | {lat.get('p99.99', 0):.0f}ns | {lat.get('max', 0):.0f}ns |")
-
-          # Save raw results as artifact
-          with open("benchmark-results.json", "w") as f:
-              json.dump(results, f, indent=2)
-          PYEOF
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: benchmark-results.json
-      - name: Write summary
-        run: |
-          python3 << 'PYEOF'
-          import subprocess, json, os
-
-          LIB = os.path.abspath("lib") + "/*.so"
-          LIB_PATH = subprocess.check_output(f"realpath {LIB}", shell=True).decode().strip()
+          LIB_PATH = subprocess.check_output("realpath lib/*.so", shell=True).decode().strip()
 
           benchmarks = [
               ("packet_churn", "/tmp/packet_churn 100000 10000", "throughput_ops_per_sec", "ops/s", "higher"),
@@ -336,8 +193,10 @@ jobs:
           ]
 
           runs = 5
-          summary = "## Benchmark Matrix Results\n\n"
-          summary += f"**System:** GitHub Actions ubuntu-latest | **Runs:** {runs} per benchmark\n\n"
+          summary = "# Benchmark Results\n\n"
+          summary += f"**System:** GitHub Actions ubuntu-latest ({subprocess.check_output('nproc', shell=True).decode().strip()} cores)\n\n"
+          summary += f"**Runs per benchmark:** {runs}\n\n"
+          summary += "---\n\n"
 
           for bench_name, cmd, metric, unit, direction in benchmarks:
               glibc_vals = []
@@ -358,9 +217,10 @@ jobs:
                       val = val.get(p, 0) if isinstance(val, dict) else 0
                   aeth_vals.append(val)
 
-              import statistics
               g_mean = statistics.mean(glibc_vals)
+              g_stdev = statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0
               a_mean = statistics.mean(aeth_vals)
+              a_stdev = statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0
               delta = ((a_mean - g_mean) / g_mean * 100) if g_mean > 0 else 0
 
               if direction == "higher":
@@ -368,8 +228,53 @@ jobs:
               else:
                   emoji = "🟢" if delta < -2 else "🔴" if delta > 2 else "➖"
 
-              summary += f"{emoji} **{bench_name}**: glibc={g_mean:,.0f} {unit} | aethalloc={a_mean:,.0f} {unit} | **{delta:+.1f}%**\n"
+              summary += f"{emoji} **{bench_name}**\n"
+              summary += f"- glibc: {g_mean:,.0f} ± {g_stdev:,.0f} {unit}\n"
+              summary += f"- aethalloc: {a_mean:,.0f} ± {a_stdev:,.0f} {unit}\n"
+              summary += f"- **delta: {delta:+.1f}%**\n\n"
+
+          # Tail latency
+          summary += "---\n\n## Tail Latency (8 threads, 50K ops)\n\n"
+          summary += "| Allocator | P50 | P99 | P99.9 | P99.99 | Max |\n"
+          summary += "|-----------|-----|-----|-------|--------|-----|\n"
+
+          for label, pre in [("glibc", ""), ("AethAlloc", f"LD_PRELOAD={LIB_PATH}")]:
+              out = subprocess.check_output(f"{pre} /tmp/tail_latency 8 50000", shell=True, stderr=subprocess.STDOUT).decode()
+              d = json.loads(out.strip())
+              lat = d.get("latency_ns", {})
+              summary += f"| {label} | {lat.get('p50', 0):,.0f}ns | {lat.get('p99', 0):,.0f}ns | {lat.get('p99.9', 0):,.0f}ns | {lat.get('p99.99', 0):,.0f}ns | {lat.get('max', 0):,.0f}ns |\n"
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
               f.write(summary)
+
+          # Also save raw JSON
+          raw = {}
+          for bench_name, cmd, metric, unit, direction in benchmarks:
+              glibc_vals = []
+              aeth_vals = []
+              for i in range(runs):
+                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
+                  d = json.loads(out.strip())
+                  parts = metric.split(".")
+                  val = d
+                  for p in parts:
+                      val = val.get(p, 0) if isinstance(val, dict) else 0
+                  glibc_vals.append(val)
+                  out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT).decode()
+                  d = json.loads(out.strip())
+                  val = d
+                  for p in parts:
+                      val = val.get(p, 0) if isinstance(val, dict) else 0
+                  aeth_vals.append(val)
+              raw[bench_name] = {
+                  "glibc": {"mean": statistics.mean(glibc_vals), "stdev": statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0, "runs": glibc_vals},
+                  "aethalloc": {"mean": statistics.mean(aeth_vals), "stdev": statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0, "runs": aeth_vals},
+              }
+          with open("benchmark-results.json", "w") as f:
+              json.dump(raw, f, indent=2)
           PYEOF
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
