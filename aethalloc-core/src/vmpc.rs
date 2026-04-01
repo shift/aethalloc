@@ -69,6 +69,9 @@ pub unsafe fn try_compact_region(ptr: NonNull<u8>, size: usize) -> bool {
 }
 
 /// No-op fallback when VMPC feature is disabled
+///
+/// # Safety
+/// This function is safe to call with any pointer - it does nothing.
 #[inline]
 #[cfg(not(feature = "vmpc"))]
 pub unsafe fn try_compact_region(_ptr: NonNull<u8>, _size: usize) -> bool {

@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Statistics accumulated by the support core
+#[derive(Default)]
 pub struct SupportCoreStats {
     pub blocks_freed: u64,
     pub compactions_run: u64,
@@ -27,20 +28,6 @@ pub struct SupportCoreStats {
     pub total_allocs_seen: u64,
     pub total_frees_seen: u64,
     pub idle_parks: u64,
-}
-
-impl Default for SupportCoreStats {
-    fn default() -> Self {
-        Self {
-            blocks_freed: 0,
-            compactions_run: 0,
-            tags_updated: 0,
-            stats_reports_received: 0,
-            total_allocs_seen: 0,
-            total_frees_seen: 0,
-            idle_parks: 0,
-        }
-    }
 }
 
 /// Support core that processes ring buffer commands
