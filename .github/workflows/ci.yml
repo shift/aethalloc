@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/*]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -65,6 +65,9 @@ jobs:
           gcc -O3 -pthread benches/producer_consumer.c -o /tmp/producer_consumer
           gcc -O3 -pthread benches/multithread_churn.c -o /tmp/multithread_churn
           gcc -O3 -pthread benches/fragmentation.c -o /tmp/fragmentation
+          gcc -O3 -pthread benches/realloc_churn.c -o /tmp/realloc_churn
+          gcc -O3 -pthread benches/realloc_large.c -o /tmp/realloc_large
+          gcc -O3 -pthread benches/fragmentation_churn.c -o /tmp/fragmentation_churn
       - name: Packet Churn
         run: |
           echo "GLIBC=$(/tmp/packet_churn | jq -r '.throughput_ops_per_sec')" >> $GITHUB_ENV
@@ -85,6 +88,18 @@ jobs:
         run: |
           echo "GLIBC_RSS=$(/tmp/fragmentation | jq -r '.summary.final_rss_kb')" >> $GITHUB_ENV
           echo "AETHALLOC_RSS=$(LD_PRELOAD=$(realpath lib/*.so) /tmp/fragmentation | jq -r '.summary.final_rss_kb')" >> $GITHUB_ENV
+      - name: Realloc Churn
+        run: |
+          echo "GLIBC_REALLOC=$(/tmp/realloc_churn 100000 2 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
+          echo "AETHALLOC_REALLOC=$(LD_PRELOAD=$(realpath lib/*.so) /tmp/realloc_churn 100000 2 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
+      - name: Realloc Large
+        run: |
+          echo "GLIBC_REALLOC_LARGE=$(/tmp/realloc_large 10000 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
+          echo "AETHALLOC_REALLOC_LARGE=$(LD_PRELOAD=$(realpath lib/*.so) /tmp/realloc_large 10000 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
+      - name: Fragmentation Churn
+        run: |
+          echo "GLIBC_FRAG_CHURN=$(/tmp/fragmentation_churn 50000 10000 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
+          echo "AETHALLOC_FRAG_CHURN=$(LD_PRELOAD=$(realpath lib/*.so) /tmp/fragmentation_churn 50000 10000 | jq -r '.latency_ns.avg')" >> $GITHUB_ENV
 
   stress-tests:
     runs-on: ubuntu-latest
