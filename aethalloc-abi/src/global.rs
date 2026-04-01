@@ -6,11 +6,15 @@
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
+
+#[cfg(feature = "amo")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "metrics")]
+#[cfg(all(feature = "metrics", feature = "amo"))]
 use aethalloc_amo::command::StatsReportPayload;
+#[cfg(feature = "amo")]
 use aethalloc_amo::command::{FreeBlockPayload, RingCommand, RingEntry, RingPayload};
+#[cfg(feature = "amo")]
 use aethalloc_amo::ring_buffer::RingBuffer;
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
@@ -22,15 +26,19 @@ use aethalloc_core::magazine::{GlobalMagazinePools, Magazine, MetadataAllocator}
 use core::sync::atomic::AtomicU64;
 
 /// AMO ring buffer capacity (power of 2)
+#[cfg(feature = "amo")]
 const AMO_RING_CAPACITY: usize = 1024;
 
 /// Static ring buffer for async metadata offloading
+#[cfg(feature = "amo")]
 static AMO_RING: RingBuffer<AMO_RING_CAPACITY> = RingBuffer::new();
 
 /// Track if support core thread has been spawned
+#[cfg(feature = "amo")]
 static SUPPORT_CORE_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Start the support core worker thread (called once)
+#[cfg(feature = "amo")]
 pub fn ensure_support_core() {
     if !SUPPORT_CORE_STARTED.load(Ordering::Acquire) {
         SUPPORT_CORE_STARTED.store(true, Ordering::Release);
@@ -41,11 +49,12 @@ pub fn ensure_support_core() {
     }
 }
 
+/// No-op when AMO is disabled
+#[cfg(not(feature = "amo"))]
+pub fn ensure_support_core() {}
+
 /// Push a FreeBlock command to the AMO ring buffer
-///
-/// Only pushes when the ring buffer has room. Non-blocking - drops
-/// entries if the buffer is full to avoid impacting the hot path.
-/// This is intentional: AMO is best-effort telemetry, not a critical path.
+#[cfg(feature = "amo")]
 #[inline]
 unsafe fn amo_push_free_block(ptr: *mut u8, size: usize, size_class: u8) {
     let payload = RingPayload {
@@ -56,19 +65,19 @@ unsafe fn amo_push_free_block(ptr: *mut u8, size: usize, size_class: u8) {
         },
     };
     let entry = RingEntry::new(RingCommand::FreeBlock, payload);
-    // Non-blocking: if ring is full, skip. The support core will catch up.
-    // This avoids stalling the dealloc hot path.
     let _ = AMO_RING.try_push(entry);
 }
 
+/// No-op when AMO is disabled
+#[cfg(not(feature = "amo"))]
+#[inline]
+unsafe fn amo_push_free_block(_ptr: *mut u8, _size: usize, _size_class: u8) {}
+
 /// Push a batch of free blocks to the AMO ring buffer
-///
-/// Called when the thread-local cache flushes to global.
-/// More efficient than individual pushes.
+#[cfg(feature = "amo")]
 #[inline]
 #[allow(dead_code)]
 unsafe fn amo_push_free_batch(ptr: *mut u8, count: u32) {
-    // Encode count in the size_class field (reuse FreeBlock command)
     let payload = RingPayload {
         free_block: FreeBlockPayload {
             ptr,
@@ -81,7 +90,7 @@ unsafe fn amo_push_free_batch(ptr: *mut u8, count: u32) {
 }
 
 /// Push a StatsReport command to the AMO ring buffer
-#[cfg(feature = "metrics")]
+#[cfg(all(feature = "amo", feature = "metrics"))]
 #[inline]
 fn amo_push_stats(thread_id: u64, allocs: u64, frees: u64) {
     let payload = RingPayload {
@@ -95,6 +104,12 @@ fn amo_push_stats(thread_id: u64, allocs: u64, frees: u64) {
     let _ = AMO_RING.try_push(entry);
 }
 
+/// No-op when AMO or metrics is disabled
+#[cfg(not(all(feature = "amo", feature = "metrics")))]
+#[inline]
+#[allow(dead_code)]
+fn amo_push_stats(_thread_id: u64, _allocs: u64, _frees: u64) {}
+
 pub const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 pub const MAX_CACHE_SIZE: usize = 65536;
@@ -102,9 +117,9 @@ const NUM_SIZE_CLASSES: usize = 14;
 #[cfg(feature = "metrics")]
 const METRICS_FLUSH_THRESHOLD: usize = 4096;
 #[cfg(not(feature = "magazine-caching"))]
-const MAX_FREE_LIST_LENGTH: usize = 4096;
+const MAX_FREE_LIST_LENGTH: usize = 8192;
 #[cfg(not(feature = "magazine-caching"))]
-const GLOBAL_FREE_BATCH: usize = 128;
+const GLOBAL_FREE_BATCH: usize = 256;
 
 pub const MAGIC: u32 = 0xA7E8A110;
 
@@ -366,24 +381,28 @@ impl ThreadMetrics {
     fn record_direct_alloc(&mut self) {}
 }
 
+/// Convert a size to a size class index (0-12 for 16B-64KB)
+///
+/// Uses bit manipulation instead of branching for maximum speed.
+/// Maps: 16→0, 32→1, 64→2, 128→3, 256→4, 512→5, 1024→6, 2048→7,
+///       4096→8, 8192→9, 16384→10, 32768→11, 65536→12
 #[inline]
 fn size_to_class(size: usize) -> Option<usize> {
-    let rounded = round_up_pow2(size).max(16);
-    match rounded {
-        16 => Some(0),
-        32 => Some(1),
-        64 => Some(2),
-        128 => Some(3),
-        256 => Some(4),
-        512 => Some(5),
-        1024 => Some(6),
-        2048 => Some(7),
-        4096 => Some(8),
-        8192 => Some(9),
-        16384 => Some(10),
-        32768 => Some(11),
-        65536 => Some(12),
-        _ => None,
+    if size > 65536 {
+        return None;
+    }
+    // Round up to next power of 2 using bit math (no branches)
+    let v = if size < 16 { 16 } else { size };
+    // round_up_pow2(v) = 1 << (64 - leading_zeros(v - 1))
+    let rounded = 1usize << (usize::BITS - (v - 1).leading_zeros());
+    // class = log2(rounded) - 4 = (63 - leading_zeros(rounded)) - 4
+    let class = 63usize
+        .wrapping_sub(rounded.leading_zeros() as usize)
+        .wrapping_sub(4);
+    if class <= 12 {
+        Some(class)
+    } else {
+        None
     }
 }
 
@@ -634,6 +653,13 @@ unsafe impl GlobalAlloc for AethAlloc {
                     cache.metrics.maybe_flush();
                     if cache.counts[class] >= MAX_FREE_LIST_LENGTH {
                         let flush_count = cache.counts[class] / 2;
+                        // Only flush in batches of GLOBAL_FREE_BATCH to reduce CAS overhead
+                        let flush_count = (flush_count / GLOBAL_FREE_BATCH) * GLOBAL_FREE_BATCH;
+                        if flush_count < GLOBAL_FREE_BATCH {
+                            cache.metrics.record_free();
+                            cache.metrics.maybe_flush();
+                            return;
+                        }
                         let batch_head = cache.heads[class];
                         let mut batch_tail = batch_head;
                         let mut walked = 1usize;

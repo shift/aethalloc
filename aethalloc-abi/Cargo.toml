@@ -13,6 +13,7 @@ magazine-caching = ["aethalloc-core/magazine"]
 simple-cache = []
 metrics = []
 vmpc = ["aethalloc-core/vmpc", "aethalloc-amo/vmpc", "dep:aethalloc-vmpc"]
+amo = []
 
 [dependencies]
 aethalloc-core = { path = "../aethalloc-core", features = ["hess"] }
