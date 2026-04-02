@@ -71,6 +71,7 @@ unsafe fn amo_push_free_block(ptr: *mut u8, size: usize, size_class: u8) {
 /// No-op when AMO is disabled
 #[cfg(not(feature = "amo"))]
 #[inline]
+#[allow(dead_code)]
 unsafe fn amo_push_free_block(_ptr: *mut u8, _size: usize, _size_class: u8) {}
 
 /// Push a batch of free blocks to the AMO ring buffer
@@ -699,9 +700,12 @@ unsafe impl GlobalAlloc for AethAlloc {
         let cache = get_thread_cache();
         cache.metrics.record_free();
         cache.metrics.maybe_flush();
-        let alloc_size = get_alloc_size(ptr);
-        let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
-        amo_push_free_block(ptr, alloc_size, size_class);
+        #[cfg(feature = "amo")]
+        {
+            let alloc_size = get_alloc_size(ptr);
+            let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
+            amo_push_free_block(ptr, alloc_size, size_class);
+        }
     }
 }
 
@@ -882,9 +886,12 @@ unsafe impl GlobalAlloc for AethAlloc {
         let cache = get_thread_cache();
         cache.metrics.record_free();
         cache.metrics.maybe_flush();
-        let alloc_size = get_alloc_size(ptr);
-        let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
-        amo_push_free_block(ptr, alloc_size, size_class);
+        #[cfg(feature = "amo")]
+        {
+            let alloc_size = get_alloc_size(ptr);
+            let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
+            amo_push_free_block(ptr, alloc_size, size_class);
+        }
     }
 }
 
