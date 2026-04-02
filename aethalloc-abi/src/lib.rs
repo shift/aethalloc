@@ -81,9 +81,9 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
         return ptr;
     }
 
-    // For large allocations, use mremap. Even with MAYMOVE (which always moves
-    // for mmap-based allocations), mremap is faster than malloc+memcpy+free
-    // because the kernel just remaps page tables instead of copying memory.
+    // For large allocations, check if the new size fits in the padded allocation.
+    // Large allocations are allocated with 2x padding, so reallocs up to 2x can
+    // return the same pointer without any mremap or copy.
     if old_size > global::MAX_CACHE_SIZE {
         let large_header_addr =
             unsafe { ptr.sub(global::LARGE_HEADER_SIZE) as *const global::LargeAllocHeader };
@@ -91,86 +91,45 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
             let base_ptr = unsafe { core::ptr::read(large_header_addr).base_ptr };
             let page_header = unsafe { core::ptr::read(base_ptr as *const global::PageHeader) };
             if page_header.magic == global::MAGIC {
-                let min_size = global::PAGE_HEADER_SIZE + global::LARGE_HEADER_SIZE + size + 8;
-                let new_pages = min_size.div_ceil(global::PAGE_SIZE).max(1) as u32;
-                let old_byte_len = page_header.num_pages as usize * global::PAGE_SIZE;
-                let new_byte_len = new_pages as usize * global::PAGE_SIZE;
-                let result = unsafe {
-                    libc::mremap(
-                        base_ptr as *mut libc::c_void,
-                        old_byte_len,
-                        new_byte_len,
-                        libc::MREMAP_MAYMOVE,
-                    )
-                };
-                if result != libc::MAP_FAILED {
-                    let new_header_ptr = result as *mut global::PageHeader;
+                // Check if new size fits in padded allocation (2x old_size)
+                let padded_capacity = page_header.num_pages as usize * global::PAGE_SIZE
+                    - global::PAGE_HEADER_SIZE
+                    - global::LARGE_HEADER_SIZE
+                    - 8;
+                if size <= padded_capacity {
+                    // Fits in existing allocation - just update the header
+                    let new_header_ptr = base_ptr as *mut global::PageHeader;
                     unsafe {
                         core::ptr::write(
                             new_header_ptr,
                             global::PageHeader {
                                 magic: global::MAGIC,
-                                num_pages: new_pages,
+                                num_pages: page_header.num_pages,
                                 requested_size: size,
                                 tag: page_header.tag,
                             },
                         );
                     }
-                    let new_base = result as *mut u8;
-                    let new_user_addr = global::AethAlloc::align_up(
-                        new_base as usize + global::PAGE_HEADER_SIZE + global::LARGE_HEADER_SIZE,
-                        8,
-                    );
-                    let new_large_header = global::LargeAllocHeader {
-                        magic: global::LARGE_MAGIC,
-                        base_ptr: new_base,
-                    };
-                    unsafe {
-                        core::ptr::write(
-                            (new_user_addr - global::LARGE_HEADER_SIZE)
-                                as *mut global::LargeAllocHeader,
-                            new_large_header,
-                        );
-                    }
-                    return new_user_addr as *mut u8;
+                    return ptr;
                 }
+                // Doesn't fit - need to reallocate
+                let new_ptr = malloc(size);
+                if !new_ptr.is_null() {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
+                    }
+                    free(ptr);
+                }
+                return new_ptr;
             }
         }
     }
 
-    // For small allocations that fit in a page, check if there's room to grow
-    // within the same page block. This avoids the malloc+memcpy+free path.
-    let rounded_old = aethalloc_core::size_class::round_up_pow2(old_size).max(16);
-    let rounded_new = aethalloc_core::size_class::round_up_pow2(size).max(16);
-
-    if rounded_new == rounded_old {
-        // Same size class - no reallocation needed
-        return ptr;
-    }
-
-    if rounded_new <= global::MAX_CACHE_SIZE && rounded_old <= global::MAX_CACHE_SIZE {
-        // Check if the new size fits in the same or next size class
-        // If the old allocation was from a page with free space, we might be able
-        // to just return the same pointer since the caller only cares about `size` bytes
-        // and we already have `old_size` bytes. Since we're growing, this doesn't help
-        // but we can at least avoid the full malloc+free path for small growths.
-    }
-
     // Fallback: malloc + memcpy + free
-    // Optimize memcpy for small copies - inline unrolled copy avoids function call overhead
     let new_ptr = malloc(size);
     if !new_ptr.is_null() {
         unsafe {
-            if old_size <= 32 {
-                // Tiny copy: unrolled byte copy
-                let src = ptr;
-                let dst = new_ptr;
-                for i in 0..old_size {
-                    *dst.add(i) = *src.add(i);
-                }
-            } else {
-                core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
-            }
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
         }
         free(ptr);
     }
