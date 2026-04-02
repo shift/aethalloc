@@ -383,19 +383,25 @@ impl ThreadMetrics {
 
 /// Convert a size to a size class index (0-12 for 16B-64KB)
 ///
-/// Uses bit manipulation instead of branching for maximum speed.
+/// Uses a 64-entry lookup table for small sizes to avoid branching
+/// and bit math on the most common allocation sizes.
 /// Maps: 16→0, 32→1, 64→2, 128→3, 256→4, 512→5, 1024→6, 2048→7,
 ///       4096→8, 8192→9, 16384→10, 32768→11, 65536→12
 #[inline]
 fn size_to_class(size: usize) -> Option<usize> {
-    if size > 65536 {
+    if size == 0 || size > 65536 {
         return None;
     }
-    // Round up to next power of 2 using bit math (no branches)
+    const LUT: [u8; 64] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2,
+    ];
+    if size <= 64 {
+        return Some(LUT[size - 1] as usize);
+    }
     let v = if size < 16 { 16 } else { size };
-    // round_up_pow2(v) = 1 << (64 - leading_zeros(v - 1))
     let rounded = 1usize << (usize::BITS - (v - 1).leading_zeros());
-    // class = log2(rounded) - 4 = (63 - leading_zeros(rounded)) - 4
     let class = 63usize
         .wrapping_sub(rounded.leading_zeros() as usize)
         .wrapping_sub(4);
