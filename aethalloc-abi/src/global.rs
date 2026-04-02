@@ -388,7 +388,7 @@ impl ThreadMetrics {
 /// and bit math on the most common allocation sizes.
 /// Maps: 16→0, 32→1, 64→2, 128→3, 256→4, 512→5, 1024→6, 2048→7,
 ///       4096→8, 8192→9, 16384→10, 32768→11, 65536→12
-#[inline]
+#[inline(always)]
 fn size_to_class(size: usize) -> Option<usize> {
     if size == 0 || size > 65536 {
         return None;
