@@ -588,8 +588,10 @@ unsafe impl GlobalAlloc for AethAlloc {
         cache.metrics.record_direct_alloc();
         cache.metrics.record_alloc();
         cache.metrics.maybe_flush();
-        // Allocate 2x the requested size to allow in-place realloc expansion.
-        // Large allocations can grow up to 2x without needing mremap.
+        // Allocate with 2x padding to allow in-place realloc expansion up to 2x.
+        // This is critical for the realloc_large benchmark and real-world patterns
+        // where allocations often grow. The memory overhead is acceptable because
+        // large allocations are relatively rare compared to small cached allocations.
         let padded_size = size * 2;
         let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + padded_size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);
@@ -784,8 +786,10 @@ unsafe impl GlobalAlloc for AethAlloc {
         cache.metrics.record_direct_alloc();
         cache.metrics.record_alloc();
         cache.metrics.maybe_flush();
-        // Allocate 2x the requested size to allow in-place realloc expansion.
-        // Large allocations can grow up to 2x without needing mremap.
+        // Allocate with 2x padding to allow in-place realloc expansion up to 2x.
+        // This is critical for the realloc_large benchmark and real-world patterns
+        // where allocations often grow. The memory overhead is acceptable because
+        // large allocations are relatively rare compared to small cached allocations.
         let padded_size = size * 2;
         let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + padded_size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);
