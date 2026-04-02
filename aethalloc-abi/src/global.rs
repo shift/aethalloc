@@ -6,59 +6,159 @@
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "amo")]
+use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(all(feature = "metrics", feature = "amo"))]
+use aethalloc_amo::command::StatsReportPayload;
+#[cfg(feature = "amo")]
+use aethalloc_amo::command::{FreeBlockPayload, RingCommand, RingEntry, RingPayload};
+#[cfg(feature = "amo")]
+use aethalloc_amo::ring_buffer::RingBuffer;
 use aethalloc_core::page::PageAllocator;
 use aethalloc_core::size_class::round_up_pow2;
 
 #[cfg(feature = "magazine-caching")]
 use aethalloc_core::magazine::{GlobalMagazinePools, Magazine, MetadataAllocator};
 
-const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
-const PAGE_MASK: usize = !(PAGE_SIZE - 1);
-const MAX_CACHE_SIZE: usize = 65536;
-const NUM_SIZE_CLASSES: usize = 14;
-const METRICS_FLUSH_THRESHOLD: usize = 4096;
-#[cfg(not(feature = "magazine-caching"))]
-const MAX_FREE_LIST_LENGTH: usize = 4096;
-#[cfg(not(feature = "magazine-caching"))]
-const GLOBAL_FREE_BATCH: usize = 128;
+#[cfg(feature = "metrics")]
+use core::sync::atomic::AtomicU64;
 
-const MAGIC: u32 = 0xA7E8A110;
+/// AMO ring buffer capacity (power of 2)
+#[cfg(feature = "amo")]
+const AMO_RING_CAPACITY: usize = 1024;
 
-#[repr(C)]
-struct PageHeader {
-    magic: u32,
-    num_pages: u32,
-    requested_size: usize,
+/// Static ring buffer for async metadata offloading
+#[cfg(feature = "amo")]
+static AMO_RING: RingBuffer<AMO_RING_CAPACITY> = RingBuffer::new();
+
+/// Track if support core thread has been spawned
+#[cfg(feature = "amo")]
+static SUPPORT_CORE_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start the support core worker thread (called once)
+#[cfg(feature = "amo")]
+pub fn ensure_support_core() {
+    if !SUPPORT_CORE_STARTED.load(Ordering::Acquire) {
+        SUPPORT_CORE_STARTED.store(true, Ordering::Release);
+        use aethalloc_amo::support_core::spawn_support_core;
+        unsafe {
+            spawn_support_core(&AMO_RING);
+        }
+    }
 }
 
-const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
-const CACHE_HEADER_SIZE: usize = 16;
-const LARGE_HEADER_SIZE: usize = 16;
-const LARGE_MAGIC: u32 = 0xA7E8A11F;
+/// No-op when AMO is disabled
+#[cfg(not(feature = "amo"))]
+pub fn ensure_support_core() {}
+
+/// Push a FreeBlock command to the AMO ring buffer
+#[cfg(feature = "amo")]
+#[inline]
+unsafe fn amo_push_free_block(ptr: *mut u8, size: usize, size_class: u8) {
+    let payload = RingPayload {
+        free_block: FreeBlockPayload {
+            ptr,
+            size,
+            size_class,
+        },
+    };
+    let entry = RingEntry::new(RingCommand::FreeBlock, payload);
+    let _ = AMO_RING.try_push(entry);
+}
+
+/// No-op when AMO is disabled
+#[cfg(not(feature = "amo"))]
+#[inline]
+#[allow(dead_code)]
+unsafe fn amo_push_free_block(_ptr: *mut u8, _size: usize, _size_class: u8) {}
+
+/// Push a batch of free blocks to the AMO ring buffer
+#[cfg(feature = "amo")]
+#[inline]
+#[allow(dead_code)]
+unsafe fn amo_push_free_batch(ptr: *mut u8, count: u32) {
+    let payload = RingPayload {
+        free_block: FreeBlockPayload {
+            ptr,
+            size: 0,
+            size_class: count as u8,
+        },
+    };
+    let entry = RingEntry::new(RingCommand::FreeBlock, payload);
+    let _ = AMO_RING.try_push(entry);
+}
+
+/// Push a StatsReport command to the AMO ring buffer
+#[cfg(all(feature = "amo", feature = "metrics"))]
+#[inline]
+fn amo_push_stats(thread_id: u64, allocs: u64, frees: u64) {
+    let payload = RingPayload {
+        stats: StatsReportPayload {
+            thread_id,
+            allocs,
+            frees,
+        },
+    };
+    let entry = RingEntry::new(RingCommand::StatsReport, payload);
+    let _ = AMO_RING.try_push(entry);
+}
+
+/// No-op when AMO or metrics is disabled
+#[cfg(not(all(feature = "amo", feature = "metrics")))]
+#[inline]
+#[allow(dead_code)]
+fn amo_push_stats(_thread_id: u64, _allocs: u64, _frees: u64) {}
+
+pub const PAGE_SIZE: usize = aethalloc_core::page::PAGE_SIZE;
+const PAGE_MASK: usize = !(PAGE_SIZE - 1);
+pub const MAX_CACHE_SIZE: usize = 65536;
+const NUM_SIZE_CLASSES: usize = 14;
+#[cfg(feature = "metrics")]
+const METRICS_FLUSH_THRESHOLD: usize = 4096;
+#[cfg(not(feature = "magazine-caching"))]
+const MAX_FREE_LIST_LENGTH: usize = 8192;
+#[cfg(not(feature = "magazine-caching"))]
+const GLOBAL_FREE_BATCH: usize = 256;
+
+pub const MAGIC: u32 = 0xA7E8A110;
 
 #[repr(C)]
-struct LargeAllocHeader {
-    magic: u32,
-    base_ptr: *mut u8,
+pub struct PageHeader {
+    pub magic: u32,
+    pub num_pages: u32,
+    pub requested_size: usize,
+    pub tag: aethalloc_core::Tag,
+}
+
+pub const PAGE_HEADER_SIZE: usize = core::mem::size_of::<PageHeader>();
+pub const CACHE_HEADER_SIZE: usize = 16;
+pub const LARGE_HEADER_SIZE: usize = 16;
+pub const LARGE_MAGIC: u32 = 0xA7E8A11F;
+
+#[repr(C)]
+pub struct LargeAllocHeader {
+    pub magic: u32,
+    pub base_ptr: *mut u8,
 }
 
 #[cfg(not(feature = "magazine-caching"))]
 struct GlobalFreeList {
-    head: AtomicPtr<u8>,
+    head: core::sync::atomic::AtomicPtr<u8>,
 }
 
 #[cfg(not(feature = "magazine-caching"))]
 impl GlobalFreeList {
     const fn new() -> Self {
         Self {
-            head: AtomicPtr::new(core::ptr::null_mut()),
+            head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
     #[inline]
     unsafe fn push_batch(&self, batch_head: *mut u8, batch_tail: *mut u8) {
+        use core::sync::atomic::Ordering;
         let mut current = self.head.load(Ordering::Relaxed);
         loop {
             core::ptr::write(batch_tail as *mut *mut u8, current);
@@ -76,6 +176,7 @@ impl GlobalFreeList {
 
     #[inline]
     unsafe fn pop(&self) -> Option<*mut u8> {
+        use core::sync::atomic::Ordering;
         let mut current = self.head.load(Ordering::Relaxed);
         loop {
             if current.is_null() {
@@ -136,6 +237,7 @@ static GLOBAL_FREE_LISTS: [GlobalFreeList; NUM_SIZE_CLASSES] = [
     GlobalFreeList::new(),
 ];
 
+#[cfg(feature = "metrics")]
 pub static GLOBAL_METRICS: GlobalMetrics = GlobalMetrics::new();
 
 #[cfg(feature = "magazine-caching")]
@@ -144,6 +246,7 @@ pub static GLOBAL_MAGAZINES: GlobalMagazinePools = GlobalMagazinePools::new();
 #[cfg(feature = "magazine-caching")]
 pub static METADATA_ALLOCATOR: MetadataAllocator = MetadataAllocator::new();
 
+#[cfg(feature = "metrics")]
 pub struct GlobalMetrics {
     pub allocs: AtomicU64,
     pub frees: AtomicU64,
@@ -152,6 +255,7 @@ pub struct GlobalMetrics {
     pub direct_allocs: AtomicU64,
 }
 
+#[cfg(feature = "metrics")]
 impl GlobalMetrics {
     const fn new() -> Self {
         Self {
@@ -174,9 +278,9 @@ impl GlobalMetrics {
     }
 }
 
+#[cfg(feature = "metrics")]
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-#[allow(dead_code)]
 pub struct MetricsSnapshot {
     pub allocs: u64,
     pub frees: u64,
@@ -185,6 +289,7 @@ pub struct MetricsSnapshot {
     pub direct_allocs: u64,
 }
 
+#[cfg(feature = "metrics")]
 struct ThreadMetrics {
     allocs: usize,
     frees: usize,
@@ -193,6 +298,10 @@ struct ThreadMetrics {
     direct_allocs: usize,
 }
 
+#[cfg(not(feature = "metrics"))]
+struct ThreadMetrics;
+
+#[cfg(feature = "metrics")]
 impl ThreadMetrics {
     const fn new() -> Self {
         Self {
@@ -222,6 +331,8 @@ impl ThreadMetrics {
             GLOBAL_METRICS
                 .direct_allocs
                 .fetch_add(self.direct_allocs as u64, Ordering::Relaxed);
+            let thread_id = unsafe { libc::pthread_self() as u64 };
+            amo_push_stats(thread_id, self.allocs as u64, self.frees as u64);
             self.allocs = 0;
             self.frees = 0;
             self.cache_hits = 0;
@@ -229,26 +340,76 @@ impl ThreadMetrics {
             self.direct_allocs = 0;
         }
     }
+
+    #[inline]
+    fn record_alloc(&mut self) {
+        self.allocs += 1;
+    }
+    #[inline]
+    fn record_free(&mut self) {
+        self.frees += 1;
+    }
+    #[inline]
+    fn record_cache_hit(&mut self) {
+        self.cache_hits += 1;
+    }
+    #[inline]
+    fn record_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+    #[inline]
+    fn record_direct_alloc(&mut self) {
+        self.direct_allocs += 1;
+    }
 }
 
-#[inline]
+#[cfg(not(feature = "metrics"))]
+impl ThreadMetrics {
+    const fn new() -> Self {
+        Self
+    }
+    #[inline]
+    fn maybe_flush(&mut self) {}
+    #[inline]
+    fn record_alloc(&mut self) {}
+    #[inline]
+    fn record_free(&mut self) {}
+    #[inline]
+    fn record_cache_hit(&mut self) {}
+    #[inline]
+    fn record_cache_miss(&mut self) {}
+    #[inline]
+    fn record_direct_alloc(&mut self) {}
+}
+
+/// Convert a size to a size class index (0-12 for 16B-64KB)
+///
+/// Uses a 64-entry lookup table for small sizes to avoid branching
+/// and bit math on the most common allocation sizes.
+/// Maps: 16→0, 32→1, 64→2, 128→3, 256→4, 512→5, 1024→6, 2048→7,
+///       4096→8, 8192→9, 16384→10, 32768→11, 65536→12
+#[inline(always)]
 fn size_to_class(size: usize) -> Option<usize> {
-    let rounded = round_up_pow2(size).max(16);
-    match rounded {
-        16 => Some(0),
-        32 => Some(1),
-        64 => Some(2),
-        128 => Some(3),
-        256 => Some(4),
-        512 => Some(5),
-        1024 => Some(6),
-        2048 => Some(7),
-        4096 => Some(8),
-        8192 => Some(9),
-        16384 => Some(10),
-        32768 => Some(11),
-        65536 => Some(12),
-        _ => None,
+    if size == 0 || size > 65536 {
+        return None;
+    }
+    const LUT: [u8; 64] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2,
+    ];
+    if size <= 64 {
+        return Some(LUT[size - 1] as usize);
+    }
+    let v = if size < 16 { 16 } else { size };
+    let rounded = 1usize << (usize::BITS - (v - 1).leading_zeros());
+    let class = 63usize
+        .wrapping_sub(rounded.leading_zeros() as usize)
+        .wrapping_sub(4);
+    if class <= 12 {
+        Some(class)
+    } else {
+        None
     }
 }
 
@@ -334,7 +495,7 @@ impl AethAlloc {
     }
 
     #[inline]
-    fn align_up(addr: usize, align: usize) -> usize {
+    pub fn align_up(addr: usize, align: usize) -> usize {
         (addr + align - 1) & !(align - 1)
     }
 
@@ -354,7 +515,6 @@ unsafe impl GlobalAlloc for AethAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
         let align = layout.align();
-
         if size == 0 {
             return core::ptr::null_mut();
         }
@@ -362,22 +522,18 @@ unsafe impl GlobalAlloc for AethAlloc {
         if size <= MAX_CACHE_SIZE && align <= 8 {
             let cache = get_thread_cache();
             let cache_size = round_up_pow2(size).max(16);
-
             if let Some(class) = size_to_class(cache_size) {
                 let head = cache.heads[class];
-
                 if !head.is_null() {
                     let next = core::ptr::read(head as *mut *mut u8);
                     cache.heads[class] = next;
                     cache.counts[class] -= 1;
-                    cache.metrics.cache_hits += 1;
-                    cache.metrics.allocs += 1;
+                    cache.metrics.record_cache_hit();
+                    cache.metrics.record_alloc();
                     cache.metrics.maybe_flush();
                     core::ptr::write(head as *mut usize, size);
                     return head.add(CACHE_HEADER_SIZE);
                 }
-
-                // Try global free list before allocating new pages (only if non-empty)
                 if !GLOBAL_FREE_LISTS[class]
                     .head
                     .load(Ordering::Relaxed)
@@ -394,20 +550,17 @@ unsafe impl GlobalAlloc for AethAlloc {
                         let next = core::ptr::read(block as *mut *mut u8);
                         cache.heads[class] = next;
                         cache.counts[class] -= 1;
-                        cache.metrics.cache_hits += 1;
-                        cache.metrics.allocs += 1;
+                        cache.metrics.record_cache_hit();
+                        cache.metrics.record_alloc();
                         cache.metrics.maybe_flush();
                         core::ptr::write(block as *mut usize, size);
                         return block.add(CACHE_HEADER_SIZE);
                     }
                 }
-
-                cache.metrics.cache_misses += 1;
-                cache.metrics.allocs += 1;
-
+                cache.metrics.record_cache_miss();
+                cache.metrics.record_alloc();
                 let block_size = cache_size + CACHE_HEADER_SIZE;
                 let blocks_per_page = PAGE_SIZE / block_size;
-
                 if blocks_per_page > 1 {
                     if let Some(base) = PageAllocator::alloc(1) {
                         let base_ptr = base.as_ptr();
@@ -422,7 +575,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                         return base_ptr.add(CACHE_HEADER_SIZE);
                     }
                 }
-
                 let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
                     let base_ptr = base.as_ptr();
@@ -433,30 +585,29 @@ unsafe impl GlobalAlloc for AethAlloc {
                 return core::ptr::null_mut();
             }
         }
-
         let cache = get_thread_cache();
-        cache.metrics.direct_allocs += 1;
-        cache.metrics.allocs += 1;
+        cache.metrics.record_direct_alloc();
+        cache.metrics.record_alloc();
         cache.metrics.maybe_flush();
-
-        let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + size + align;
+        // Allocate with 2x padding to allow in-place realloc expansion up to 2x.
+        // This is critical for the realloc_large benchmark and real-world patterns
+        // where allocations often grow. The memory overhead is acceptable because
+        // large allocations are relatively rare compared to small cached allocations.
+        let padded_size = size * 2;
+        let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + padded_size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);
-
         match PageAllocator::alloc(pages) {
             Some(base) => {
                 let base_addr = base.as_ptr() as usize;
-
                 let page_header = PageHeader {
                     magic: MAGIC,
                     num_pages: pages as u32,
                     requested_size: size,
+                    tag: 0,
                 };
-                let header_ptr = base.as_ptr() as *mut PageHeader;
-                core::ptr::write(header_ptr, page_header);
-
+                core::ptr::write(base.as_ptr() as *mut PageHeader, page_header);
                 let user_addr =
                     Self::align_up(base_addr + PAGE_HEADER_SIZE + LARGE_HEADER_SIZE, align);
-
                 let large_header = LargeAllocHeader {
                     magic: LARGE_MAGIC,
                     base_ptr: base.as_ptr(),
@@ -465,7 +616,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                     (user_addr - LARGE_HEADER_SIZE) as *mut LargeAllocHeader,
                     large_header,
                 );
-
                 user_addr as *mut u8
             }
             None => core::ptr::null_mut(),
@@ -476,63 +626,64 @@ unsafe impl GlobalAlloc for AethAlloc {
         if ptr.is_null() {
             return;
         }
-
-        // Check for large allocation first (LargeAllocHeader immediately before ptr)
         let large_header_addr = ptr.sub(LARGE_HEADER_SIZE) as *const LargeAllocHeader;
         if core::ptr::read(large_header_addr).magic == LARGE_MAGIC {
             let base_ptr = core::ptr::read(large_header_addr).base_ptr;
             let page_header = core::ptr::read(base_ptr as *const PageHeader);
-
             if page_header.magic == MAGIC && page_header.num_pages > 0 {
-                PageAllocator::dealloc(
-                    NonNull::new_unchecked(base_ptr),
-                    page_header.num_pages as usize,
-                );
+                let size = page_header.num_pages as usize * PAGE_SIZE;
+                let base_ptr_nn = NonNull::new_unchecked(base_ptr);
+                #[cfg(feature = "vmpc")]
+                {
+                    use aethalloc_core::try_compact_region;
+                    let _compacted = try_compact_region(base_ptr_nn, size);
+                }
+                #[cfg(not(feature = "vmpc"))]
+                {
+                    let _ = (base_ptr_nn, size);
+                }
+                PageAllocator::dealloc(base_ptr_nn, page_header.num_pages as usize);
             }
-
             let cache = get_thread_cache();
-            cache.metrics.frees += 1;
+            cache.metrics.record_free();
             cache.metrics.maybe_flush();
             return;
         }
-
         let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
         let maybe_size = core::ptr::read(size_ptr);
-
         if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
             let potential_header = size_ptr as *mut PageHeader;
             if core::ptr::read(potential_header).magic != MAGIC {
                 let cache = get_thread_cache();
                 let cache_size = round_up_pow2(maybe_size).max(16);
-
                 if let Some(class) = size_to_class(cache_size) {
                     let head_ptr = size_ptr as *mut *mut u8;
                     core::ptr::write(head_ptr, cache.heads[class]);
                     cache.heads[class] = size_ptr as *mut u8;
                     cache.counts[class] += 1;
-                    cache.metrics.frees += 1;
+                    cache.metrics.record_free();
                     cache.metrics.maybe_flush();
-
-                    // Anti-hoarding: flush excess to global free list with O(1) batch push
                     if cache.counts[class] >= MAX_FREE_LIST_LENGTH {
                         let flush_count = cache.counts[class] / 2;
-
+                        // Only flush in batches of GLOBAL_FREE_BATCH to reduce CAS overhead
+                        let flush_count = (flush_count / GLOBAL_FREE_BATCH) * GLOBAL_FREE_BATCH;
+                        if flush_count < GLOBAL_FREE_BATCH {
+                            cache.metrics.record_free();
+                            cache.metrics.maybe_flush();
+                            return;
+                        }
                         let batch_head = cache.heads[class];
                         let mut batch_tail = batch_head;
                         let mut walked = 1usize;
-
                         while walked < flush_count && !batch_tail.is_null() {
                             batch_tail = core::ptr::read(batch_tail as *mut *mut u8);
                             walked += 1;
                         }
-
                         if !batch_tail.is_null() {
                             let new_local_head = core::ptr::read(batch_tail as *mut *mut u8);
                             core::ptr::write(batch_tail as *mut *mut u8, core::ptr::null_mut());
-
                             cache.heads[class] = new_local_head;
                             cache.counts[class] -= flush_count;
-
                             GLOBAL_FREE_LISTS[class].push_batch(batch_head, batch_tail);
                         }
                     }
@@ -540,18 +691,21 @@ unsafe impl GlobalAlloc for AethAlloc {
                 }
             }
         }
-
         let header = Self::page_header_from_ptr(ptr);
         let header_ref = core::ptr::read(header);
-
         if header_ref.magic == MAGIC && header_ref.num_pages > 0 {
             let base = NonNull::new_unchecked(header as *mut u8);
             PageAllocator::dealloc(base, header_ref.num_pages as usize);
         }
-
         let cache = get_thread_cache();
-        cache.metrics.frees += 1;
+        cache.metrics.record_free();
         cache.metrics.maybe_flush();
+        #[cfg(feature = "amo")]
+        {
+            let alloc_size = get_alloc_size(ptr);
+            let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
+            amo_push_free_block(ptr, alloc_size, size_class);
+        }
     }
 }
 
@@ -564,7 +718,6 @@ unsafe impl GlobalAlloc for AethAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
         let align = layout.align();
-
         if size == 0 {
             return core::ptr::null_mut();
         }
@@ -572,54 +725,41 @@ unsafe impl GlobalAlloc for AethAlloc {
         if size <= MAX_CACHE_SIZE && align <= 8 {
             let cache = get_thread_cache();
             let cache_size = round_up_pow2(size).max(16);
-
             if let Some(class) = size_to_class(cache_size) {
-                // Try local alloc magazine
                 if let Some(block) = cache.alloc_mags[class].pop() {
-                    cache.metrics.cache_hits += 1;
-                    cache.metrics.allocs += 1;
+                    cache.metrics.record_cache_hit();
+                    cache.metrics.record_alloc();
                     cache.metrics.maybe_flush();
                     core::ptr::write(block as *mut usize, size);
                     return block.add(CACHE_HEADER_SIZE);
                 }
-
-                // Try swap with local free_mag for reuse
                 if !cache.free_mags[class].is_empty() {
                     core::mem::swap(&mut cache.alloc_mags[class], &mut cache.free_mags[class]);
                     if let Some(block) = cache.alloc_mags[class].pop() {
-                        cache.metrics.cache_hits += 1;
-                        cache.metrics.allocs += 1;
+                        cache.metrics.record_cache_hit();
+                        cache.metrics.record_alloc();
                         cache.metrics.maybe_flush();
                         core::ptr::write(block as *mut usize, size);
                         return block.add(CACHE_HEADER_SIZE);
                     }
                 }
-
-                // Try to get a full magazine from global pool
                 if let Some(node_ptr) = GLOBAL_MAGAZINES.get(class).pop_full() {
                     let node = &mut *node_ptr;
                     core::mem::swap(&mut cache.alloc_mags[class], &mut node.magazine);
                     node.magazine.clear();
-                    unsafe {
-                        GLOBAL_MAGAZINES.get(class).push_empty(node_ptr);
-                    }
-
+                    GLOBAL_MAGAZINES.get(class).push_empty(node_ptr);
                     if let Some(block) = cache.alloc_mags[class].pop() {
-                        cache.metrics.cache_hits += 1;
-                        cache.metrics.allocs += 1;
+                        cache.metrics.record_cache_hit();
+                        cache.metrics.record_alloc();
                         cache.metrics.maybe_flush();
                         core::ptr::write(block as *mut usize, size);
                         return block.add(CACHE_HEADER_SIZE);
                     }
                 }
-
-                // Cache miss - allocate fresh blocks
-                cache.metrics.cache_misses += 1;
-                cache.metrics.allocs += 1;
-
+                cache.metrics.record_cache_miss();
+                cache.metrics.record_alloc();
                 let block_size = cache_size + CACHE_HEADER_SIZE;
                 let blocks_per_page = PAGE_SIZE / block_size;
-
                 if blocks_per_page > 1 {
                     if let Some(base) = PageAllocator::alloc(1) {
                         let base_ptr = base.as_ptr();
@@ -636,7 +776,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                         return base_ptr.add(CACHE_HEADER_SIZE);
                     }
                 }
-
                 let pages = block_size.div_ceil(PAGE_SIZE).max(1);
                 if let Some(base) = PageAllocator::alloc(pages) {
                     let base_ptr = base.as_ptr();
@@ -647,30 +786,29 @@ unsafe impl GlobalAlloc for AethAlloc {
                 return core::ptr::null_mut();
             }
         }
-
         let cache = get_thread_cache();
-        cache.metrics.direct_allocs += 1;
-        cache.metrics.allocs += 1;
+        cache.metrics.record_direct_alloc();
+        cache.metrics.record_alloc();
         cache.metrics.maybe_flush();
-
-        // Large allocation with LargeAllocHeader (same as simple-cache mode)
-        let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + size + align;
+        // Allocate with 2x padding to allow in-place realloc expansion up to 2x.
+        // This is critical for the realloc_large benchmark and real-world patterns
+        // where allocations often grow. The memory overhead is acceptable because
+        // large allocations are relatively rare compared to small cached allocations.
+        let padded_size = size * 2;
+        let min_size = PAGE_HEADER_SIZE + LARGE_HEADER_SIZE + padded_size + align;
         let pages = min_size.div_ceil(PAGE_SIZE).max(1);
-
         match PageAllocator::alloc(pages) {
             Some(base) => {
                 let base_addr = base.as_ptr() as usize;
-
                 let page_header = PageHeader {
                     magic: MAGIC,
                     num_pages: pages as u32,
                     requested_size: size,
+                    tag: 0,
                 };
                 core::ptr::write(base.as_ptr() as *mut PageHeader, page_header);
-
                 let user_addr =
                     Self::align_up(base_addr + PAGE_HEADER_SIZE + LARGE_HEADER_SIZE, align);
-
                 let large_header = LargeAllocHeader {
                     magic: LARGE_MAGIC,
                     base_ptr: base.as_ptr(),
@@ -679,7 +817,6 @@ unsafe impl GlobalAlloc for AethAlloc {
                     (user_addr - LARGE_HEADER_SIZE) as *mut LargeAllocHeader,
                     large_header,
                 );
-
                 user_addr as *mut u8
             }
             None => core::ptr::null_mut(),
@@ -690,76 +827,71 @@ unsafe impl GlobalAlloc for AethAlloc {
         if ptr.is_null() {
             return;
         }
-
-        // Check for large allocation first (LargeAllocHeader immediately before ptr)
         let large_header_addr = ptr.sub(LARGE_HEADER_SIZE) as *const LargeAllocHeader;
         if core::ptr::read(large_header_addr).magic == LARGE_MAGIC {
             let base_ptr = core::ptr::read(large_header_addr).base_ptr;
             let page_header = core::ptr::read(base_ptr as *const PageHeader);
-
             if page_header.magic == MAGIC && page_header.num_pages > 0 {
-                PageAllocator::dealloc(
-                    NonNull::new_unchecked(base_ptr),
-                    page_header.num_pages as usize,
-                );
+                let size = page_header.num_pages as usize * PAGE_SIZE;
+                let base_ptr_nn = NonNull::new_unchecked(base_ptr);
+                #[cfg(feature = "vmpc")]
+                {
+                    use aethalloc_core::try_compact_region;
+                    let _compacted = try_compact_region(base_ptr_nn, size);
+                }
+                #[cfg(not(feature = "vmpc"))]
+                {
+                    let _ = (base_ptr_nn, size);
+                }
+                PageAllocator::dealloc(base_ptr_nn, page_header.num_pages as usize);
             }
-
             let cache = get_thread_cache();
-            cache.metrics.frees += 1;
+            cache.metrics.record_free();
             cache.metrics.maybe_flush();
             return;
         }
-
         let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
         let maybe_size = core::ptr::read(size_ptr);
-
         if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
             let potential_header = size_ptr as *mut PageHeader;
             if core::ptr::read(potential_header).magic != MAGIC {
                 let cache = get_thread_cache();
                 let cache_size = round_up_pow2(maybe_size).max(16);
-
                 if let Some(class) = size_to_class(cache_size) {
                     let block_ptr = size_ptr as *mut u8;
-
-                    // Try local free magazine
                     if cache.free_mags[class].push(block_ptr) {
-                        cache.metrics.frees += 1;
+                        cache.metrics.record_free();
                         cache.metrics.maybe_flush();
                         return;
                     }
-
-                    // Magazine full - push to global pool using metadata allocator
                     let node = METADATA_ALLOCATOR.alloc_node();
-
                     if !node.is_null() {
                         (*node).magazine = core::mem::take(&mut cache.free_mags[class]);
                         (*node).next = core::ptr::null_mut();
-                        unsafe {
-                            GLOBAL_MAGAZINES.get(class).push_full(node);
-                        }
+                        GLOBAL_MAGAZINES.get(class).push_full(node);
                     }
-
-                    // Push to now-empty magazine
                     let _ = cache.free_mags[class].push(block_ptr);
-                    cache.metrics.frees += 1;
+                    cache.metrics.record_free();
                     cache.metrics.maybe_flush();
                     return;
                 }
             }
         }
-
         let header = Self::page_header_from_ptr(ptr);
         let header_ref = core::ptr::read(header);
-
         if header_ref.magic == MAGIC && header_ref.num_pages > 0 {
             let base = NonNull::new_unchecked(header as *mut u8);
             PageAllocator::dealloc(base, header_ref.num_pages as usize);
         }
-
         let cache = get_thread_cache();
-        cache.metrics.frees += 1;
+        cache.metrics.record_free();
         cache.metrics.maybe_flush();
+        #[cfg(feature = "amo")]
+        {
+            let alloc_size = get_alloc_size(ptr);
+            let size_class = size_to_class(round_up_pow2(alloc_size).max(16)).unwrap_or(0) as u8;
+            amo_push_free_block(ptr, alloc_size, size_class);
+        }
     }
 }
 
@@ -767,8 +899,16 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
     if ptr.is_null() {
         return 0;
     }
-
-    // Check for large allocation first (LargeAllocHeader immediately before ptr)
+    // Fast path: check cache header first (most common for small allocs)
+    let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
+    let maybe_size = core::ptr::read(size_ptr);
+    if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
+        let potential_header = size_ptr as *mut PageHeader;
+        if core::ptr::read(potential_header).magic != MAGIC {
+            return maybe_size;
+        }
+    }
+    // Slow path: check large allocation header
     let large_header_addr = ptr.sub(LARGE_HEADER_SIZE) as *const LargeAllocHeader;
     if core::ptr::read(large_header_addr).magic == LARGE_MAGIC {
         let base_ptr = core::ptr::read(large_header_addr).base_ptr;
@@ -778,21 +918,9 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
         }
         return 0;
     }
-
-    // Check for small cached allocation
-    let size_ptr = ptr.sub(CACHE_HEADER_SIZE) as *mut usize;
-    let maybe_size = core::ptr::read(size_ptr);
-
-    if maybe_size > 0 && maybe_size <= MAX_CACHE_SIZE {
-        let potential_header = size_ptr as *mut PageHeader;
-        if core::ptr::read(potential_header).magic != MAGIC {
-            return maybe_size;
-        }
-    }
-
+    // Fallback: page header lookup
     let header = AethAlloc::page_header_from_ptr(ptr);
     let header_ref = core::ptr::read(header);
-
     if header_ref.magic == MAGIC {
         header_ref.requested_size
     } else {
@@ -800,12 +928,14 @@ pub unsafe fn get_alloc_size(ptr: *mut u8) -> usize {
     }
 }
 
+#[cfg(feature = "metrics")]
 #[no_mangle]
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn aethalloc_get_metrics() -> MetricsSnapshot {
     GLOBAL_METRICS.snapshot()
 }
 
+#[cfg(feature = "metrics")]
 #[allow(dead_code)]
 pub unsafe fn flush_thread_metrics() {
     let cache = get_thread_cache();

@@ -5,7 +5,7 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-pub const MAGAZINE_CAPACITY: usize = 64;
+pub const MAGAZINE_CAPACITY: usize = 128;
 pub const NUM_SIZE_CLASSES: usize = 13;
 pub const MAX_GLOBAL_MAGAZINES_PER_CLASS: usize = 8;
 

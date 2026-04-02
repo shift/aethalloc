@@ -1,11 +1,8 @@
 //! AethAlloc ABI - C-compatible allocator interface for LD_PRELOAD injection
 
 #![feature(thread_local)]
-#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-
-#[cfg(test)]
 extern crate std;
 
 use alloc::alloc::{GlobalAlloc, Layout};
@@ -22,6 +19,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 fn ensure_init() {
     if !INITIALIZED.load(Ordering::Acquire) {
         INITIALIZED.store(true, Ordering::Release);
+        global::ensure_support_core();
     }
 }
 
@@ -75,12 +73,63 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     }
 
     let old_size = unsafe { global::get_alloc_size(ptr) };
+    if old_size == 0 {
+        return ptr::null_mut();
+    }
 
+    if size <= old_size {
+        return ptr;
+    }
+
+    // For large allocations, check if the new size fits in the padded allocation.
+    // Large allocations are allocated with 2x padding, so reallocs up to 2x can
+    // return the same pointer without any mremap or copy.
+    if old_size > global::MAX_CACHE_SIZE {
+        let large_header_addr =
+            unsafe { ptr.sub(global::LARGE_HEADER_SIZE) as *const global::LargeAllocHeader };
+        if unsafe { core::ptr::read(large_header_addr).magic } == global::LARGE_MAGIC {
+            let base_ptr = unsafe { core::ptr::read(large_header_addr).base_ptr };
+            let page_header = unsafe { core::ptr::read(base_ptr as *const global::PageHeader) };
+            if page_header.magic == global::MAGIC {
+                // Check if new size fits in padded allocation (2x old_size)
+                let padded_capacity = page_header.num_pages as usize * global::PAGE_SIZE
+                    - global::PAGE_HEADER_SIZE
+                    - global::LARGE_HEADER_SIZE
+                    - 8;
+                if size <= padded_capacity {
+                    // Fits in existing allocation - just update the header
+                    let new_header_ptr = base_ptr as *mut global::PageHeader;
+                    unsafe {
+                        core::ptr::write(
+                            new_header_ptr,
+                            global::PageHeader {
+                                magic: global::MAGIC,
+                                num_pages: page_header.num_pages,
+                                requested_size: size,
+                                tag: page_header.tag,
+                            },
+                        );
+                    }
+                    return ptr;
+                }
+                // Doesn't fit - need to reallocate
+                let new_ptr = malloc(size);
+                if !new_ptr.is_null() {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
+                    }
+                    free(ptr);
+                }
+                return new_ptr;
+            }
+        }
+    }
+
+    // Fallback: malloc + memcpy + free
     let new_ptr = malloc(size);
     if !new_ptr.is_null() {
-        let copy_size = old_size.min(size);
         unsafe {
-            core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, old_size);
         }
         free(ptr);
     }
@@ -119,10 +168,4 @@ pub extern "C" fn posix_memalign(memptr: *mut *mut u8, alignment: usize, size: u
         *memptr = ptr;
     }
     0
-}
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }

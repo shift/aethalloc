@@ -1,20 +1,168 @@
-name: Benchmarks
+name: Benchmark Matrix
 
 on:
+  push:
+    branches: [feature/wire-advanced-features]
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday
 
 jobs:
-  full-benchmark:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
         with:
           nix_path: nixpkgs=channel:nixos-unstable
+      - name: Cache Nix store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/nix
+            /nix/store
+          key: nix-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/flake.nix', '**/flake.lock') }}
+          restore-keys: |
+            nix-${{ runner.os }}-
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Build
         run: nix build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libaethalloc
+          path: result/lib/*.so
+
+  benchmark-matrix:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark:
+          - name: packet_churn
+            cmd: "/tmp/packet_churn 100000 10000"
+            metric: throughput_ops_per_sec
+            unit: ops/s
+            direction: higher
+          - name: multithread_churn
+            cmd: "/tmp/multithread_churn 8 100000"
+            metric: throughput_ops_per_sec
+            unit: ops/s
+            direction: higher
+          - name: kv_store
+            cmd: "/tmp/kv_store"
+            metric: throughput_ops_per_sec
+            unit: ops/s
+            direction: higher
+          - name: producer_consumer
+            cmd: "/tmp/producer_consumer"
+            metric: throughput_ops_per_sec
+            unit: ops/s
+            direction: higher
+          - name: realloc_churn
+            cmd: "/tmp/realloc_churn 100000 2"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: realloc_large
+            cmd: "/tmp/realloc_large 10000"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: fragmentation_churn
+            cmd: "/tmp/fragmentation_churn 50000 10000"
+            metric: latency_ns.avg
+            unit: ns
+            direction: lower
+          - name: fragmentation_rss
+            cmd: "/tmp/fragmentation"
+            metric: summary.final_rss_kb
+            unit: KB
+            direction: lower
+        run_id: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libaethalloc
+          path: ./lib
+      - name: Compile benchmarks
+        run: |
+          gcc -O3 -pthread benches/packet_churn.c -o /tmp/packet_churn
+          gcc -O3 -pthread benches/kv_store.c -o /tmp/kv_store
+          gcc -O3 -pthread benches/producer_consumer.c -o /tmp/producer_consumer
+          gcc -O3 -pthread benches/multithread_churn.c -o /tmp/multithread_churn
+          gcc -O3 -pthread benches/fragmentation.c -o /tmp/fragmentation
+          gcc -O3 -pthread benches/realloc_churn.c -o /tmp/realloc_churn
+          gcc -O3 -pthread benches/realloc_large.c -o /tmp/realloc_large
+          gcc -O3 -pthread benches/fragmentation_churn.c -o /tmp/fragmentation_churn
+      - name: Run glibc baseline
+        id: glibc
+        run: |
+          RESULT=$(${{ matrix.benchmark.cmd }} 2>&1)
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Run aethalloc
+        id: aethalloc
+        run: |
+          LIB=$(realpath lib/*.so)
+          RESULT=$(LD_PRELOAD="$LIB" ${{ matrix.benchmark.cmd }} 2>&1)
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Compare
+        run: |
+          python3 -c "
+          import json, os
+          glibc = json.loads(os.environ['GLIBC_RESULT'])
+          aeth = json.loads(os.environ['AETH_RESULT'])
+          metric_path = os.environ['METRIC'].split('.')
+          def get_nested(d, path):
+              for key in path:
+                  if isinstance(d, dict):
+                      d = d.get(key, 0)
+                  else:
+                      return 0
+              return d
+          glibc_val = get_nested(glibc, metric_path)
+          aeth_val = get_nested(aeth, metric_path)
+          delta = ((aeth_val - glibc_val) / glibc_val * 100) if glibc_val > 0 else 0
+          direction = os.environ['DIRECTION']
+          if direction == 'higher':
+              emoji = '🟢' if delta > 0 else '🔴' if delta < 0 else '➖'
+          else:
+              emoji = '🟢' if delta < 0 else '🔴' if delta > 0 else '➖'
+          print(f'{emoji} {os.environ[\"BENCH_NAME\"]} run {os.environ[\"RUN_ID\"]}: glibc={glibc_val:,.2f} | aethalloc={aeth_val:,.2f} | delta={delta:+.1f}%')
+          "
+        env:
+          GLIBC_RESULT: ${{ steps.glibc.outputs.result }}
+          AETH_RESULT: ${{ steps.aethalloc.outputs.result }}
+          METRIC: ${{ matrix.benchmark.metric }}
+          DIRECTION: ${{ matrix.benchmark.direction }}
+          BENCH_NAME: ${{ matrix.benchmark.name }}
+          RUN_ID: ${{ matrix.run_id }}
+
+  summarize:
+    needs: benchmark-matrix
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libaethalloc
+          path: ./lib
       - name: Compile all benchmarks
         run: |
           gcc -O3 -pthread benches/packet_churn.c -o /tmp/packet_churn
@@ -22,92 +170,132 @@ jobs:
           gcc -O3 -pthread benches/producer_consumer.c -o /tmp/producer_consumer
           gcc -O3 -pthread benches/multithread_churn.c -o /tmp/multithread_churn
           gcc -O3 -pthread benches/fragmentation.c -o /tmp/fragmentation
+          gcc -O3 -pthread benches/realloc_churn.c -o /tmp/realloc_churn
+          gcc -O3 -pthread benches/realloc_large.c -o /tmp/realloc_large
+          gcc -O3 -pthread benches/fragmentation_churn.c -o /tmp/fragmentation_churn
           gcc -O3 benches/tail_latency.c -o /tmp/tail_latency
-          gcc -O3 benches/massive_alloc.c -o /tmp/massive_alloc
-          gcc -O3 benches/corruption_test.c -o /tmp/corruption_test
-      - name: Run all benchmarks
-        id: benchmarks
+      - name: Run full benchmark suite
         run: |
-          AETHALLOC="LD_PRELOAD=$(realpath result/lib/*.so)"
-          
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Test System:** GitHub Actions ubuntu-latest" >> $GITHUB_STEP_SUMMARY
-          echo "**Date:** $(date -I)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          echo "### Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Benchmark | glibc | AethAlloc | Ratio |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          
-          # Packet Churn
-          GLIBC_PC=$(/tmp/packet_churn | jq -r '.throughput_ops_per_sec')
-          AETH_PC=$($AETHALLOC /tmp/packet_churn | jq -r '.throughput_ops_per_sec')
-          RATIO_PC=$(echo "scale=0; $AETH_PC * 100 / $GLIBC_PC" | bc)
-          echo "| Packet Churn | ${GLIBC_PC} | ${AETH_PC} | ${RATIO_PC}% |" >> $GITHUB_STEP_SUMMARY
-          
-          # KV Store
-          GLIBC_KV=$(/tmp/kv_store | jq -r '.throughput_ops_per_sec')
-          AETH_KV=$($AETHALLOC /tmp/kv_store | jq -r '.throughput_ops_per_sec')
-          RATIO_KV=$(echo "scale=0; $AETH_KV * 100 / $GLIBC_KV" | bc)
-          echo "| KV Store | ${GLIBC_KV} | ${AETH_KV} | ${RATIO_KV}% |" >> $GITHUB_STEP_SUMMARY
-          
-          # Producer-Consumer
-          GLIBC_PCS=$(/tmp/producer_consumer | jq -r '.throughput_ops_per_sec')
-          AETH_PCS=$($AETHALLOC /tmp/producer_consumer | jq -r '.throughput_ops_per_sec')
-          RATIO_PCS=$(echo "scale=0; $AETH_PCS * 100 / $GLIBC_PCS" | bc)
-          echo "| Producer-Consumer | ${GLIBC_PCS} | ${AETH_PCS} | ${RATIO_PCS}% |" >> $GITHUB_STEP_SUMMARY
-          
-          # Multithread
-          GLIBC_MT=$(/tmp/multithread_churn | jq -r '.throughput_ops_per_sec')
-          AETH_MT=$($AETHALLOC /tmp/multithread_churn | jq -r '.throughput_ops_per_sec')
-          RATIO_MT=$(echo "scale=0; $AETH_MT * 100 / $GLIBC_MT" | bc)
-          echo "| Multithread (8T) | ${GLIBC_MT} | ${AETH_MT} | ${RATIO_MT}% |" >> $GITHUB_STEP_SUMMARY
-          
-          # Fragmentation
-          GLIBC_RSS=$(/tmp/fragmentation | jq -r '.summary.final_rss_kb')
-          AETH_RSS=$($AETHALLOC /tmp/fragmentation | jq -r '.summary.final_rss_kb')
-          RATIO_RSS=$(echo "scale=1; $GLIBC_RSS / $AETH_RSS" | bc)
-          echo "| Fragmentation RSS | ${GLIBC_RSS} KB | ${AETH_RSS} KB | ${RATIO_RSS}x better |" >> $GITHUB_STEP_SUMMARY
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tail Latency (8 threads, 50K ops each)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Allocator | P50 | P99 | P99.9 | P99.99 | Max |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-----|-----|-------|--------|-----|" >> $GITHUB_STEP_SUMMARY
-          
-          GLIBC_LAT=$(/tmp/tail_latency 8 50000)
-          AETH_LAT=$($AETHALLOC /tmp/tail_latency 8 50000)
-          
-          GLIBC_P50=$(echo "$GLIBC_LAT" | jq -r '.latency_ns.p50')
-          GLIBC_P99=$(echo "$GLIBC_LAT" | jq -r '.latency_ns.p99')
-          GLIBC_P999=$(echo "$GLIBC_LAT" | jq -r '.latency_ns["p99.9"]')
-          GLIBC_P9999=$(echo "$GLIBC_LAT" | jq -r '.latency_ns["p99.99"]')
-          GLIBC_MAX=$(echo "$GLIBC_LAT" | jq -r '.latency_ns.max')
-          
-          AETH_P50=$(echo "$AETH_LAT" | jq -r '.latency_ns.p50')
-          AETH_P99=$(echo "$AETH_LAT" | jq -r '.latency_ns.p99')
-          AETH_P999=$(echo "$AETH_LAT" | jq -r '.latency_ns["p99.9"]')
-          AETH_P9999=$(echo "$AETH_LAT" | jq -r '.latency_ns["p99.99"]')
-          AETH_MAX=$(echo "$AETH_LAT" | jq -r '.latency_ns.max')
-          
-          echo "| glibc | ${GLIBC_P50}ns | ${GLIBC_P99}ns | ${GLIBC_P999}ns | ${GLIBC_P9999}ns | ${GLIBC_MAX}ns |" >> $GITHUB_STEP_SUMMARY
-          echo "| AethAlloc | ${AETH_P50}ns | ${AETH_P99}ns | ${AETH_P999}ns | ${AETH_P9999}ns | ${AETH_MAX}ns |" >> $GITHUB_STEP_SUMMARY
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Massive Allocations" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "=== glibc ===" >> $GITHUB_STEP_SUMMARY
-          /tmp/massive_alloc >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "=== AethAlloc ===" >> $GITHUB_STEP_SUMMARY
-          $AETHALLOC /tmp/massive_alloc >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Corruption Test" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          $AETHALLOC /tmp/corruption_test >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYEOF'
+          import subprocess, json, statistics, os
+
+          LIB_PATH = subprocess.check_output("realpath lib/*.so", shell=True).decode().strip()
+
+          benchmarks = [
+              ("packet_churn", "/tmp/packet_churn 100000 10000", "throughput_ops_per_sec", "ops/s", "higher"),
+              ("multithread_churn", "/tmp/multithread_churn 8 100000", "throughput_ops_per_sec", "ops/s", "higher"),
+              ("kv_store", "/tmp/kv_store", "throughput_ops_per_sec", "ops/s", "higher"),
+              ("producer_consumer", "/tmp/producer_consumer", "throughput_ops_per_sec", "ops/s", "higher"),
+              ("realloc_churn", "/tmp/realloc_churn 100000 2", "latency_ns.avg", "ns", "lower"),
+              ("realloc_large", "/tmp/realloc_large 10000", "latency_ns.avg", "ns", "lower"),
+              ("fragmentation_churn", "/tmp/fragmentation_churn 50000 10000", "latency_ns.avg", "ns", "lower"),
+              ("fragmentation_rss", "/tmp/fragmentation", "summary.final_rss_kb", "KB", "lower"),
+          ]
+
+          runs = 5
+          summary = "# Benchmark Results\n\n"
+          summary += f"**System:** GitHub Actions ubuntu-latest ({subprocess.check_output('nproc', shell=True).decode().strip()} cores)\n\n"
+          summary += f"**Runs per benchmark:** {runs}\n\n"
+          summary += "---\n\n"
+
+          for bench_name, cmd, metric, unit, direction in benchmarks:
+              glibc_vals = []
+              aeth_vals = []
+              for i in range(runs):
+                  try:
+                      out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      glibc_vals.append(val)
+                  except Exception as e:
+                      print(f"WARNING: glibc {bench_name} run {i+1} failed: {e}")
+
+                  try:
+                      out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      aeth_vals.append(val)
+                  except Exception as e:
+                      print(f"WARNING: aethalloc {bench_name} run {i+1} failed: {e}")
+
+              g_mean = statistics.mean(glibc_vals) if glibc_vals else 0
+              g_stdev = statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0
+              a_mean = statistics.mean(aeth_vals) if aeth_vals else 0
+              a_stdev = statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0
+              delta = ((a_mean - g_mean) / g_mean * 100) if g_mean > 0 else 0
+
+              if direction == "higher":
+                  emoji = "🟢" if delta > 2 else "🔴" if delta < -2 else "➖"
+              else:
+                  emoji = "🟢" if delta < -2 else "🔴" if delta > 2 else "➖"
+
+              summary += f"{emoji} **{bench_name}**\n"
+              if glibc_vals or aeth_vals:
+                  summary += f"- glibc: {g_mean:,.0f} ± {g_stdev:,.0f} {unit}\n"
+                  summary += f"- aethalloc: {a_mean:,.0f} ± {a_stdev:,.0f} {unit}\n"
+                  summary += f"- **delta: {delta:+.1f}%**\n\n"
+              else:
+                  summary += f"- ⚠️ All runs failed (benchmark may not work on this platform)\n\n"
+
+          # Tail latency
+          summary += "---\n\n## Tail Latency (8 threads, 50K ops)\n\n"
+          summary += "| Allocator | P50 | P99 | P99.9 | P99.99 | Max |\n"
+          summary += "|-----------|-----|-----|-------|--------|-----|\n"
+
+          for label, pre in [("glibc", ""), ("AethAlloc", f"LD_PRELOAD={LIB_PATH}")]:
+              try:
+                  out = subprocess.check_output(f"{pre} /tmp/tail_latency 8 50000", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                  d = json.loads(out.strip())
+                  lat = d.get("latency_ns", {})
+                  summary += f"| {label} | {lat.get('p50', 0):,.0f}ns | {lat.get('p99', 0):,.0f}ns | {lat.get('p99.9', 0):,.0f}ns | {lat.get('p99.99', 0):,.0f}ns | {lat.get('max', 0):,.0f}ns |\n"
+              except Exception as e:
+                  summary += f"| {label} | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |\n"
+                  print(f"WARNING: {label} tail_latency failed: {e}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
+              f.write(summary)
+
+          # Also save raw JSON
+          raw = {}
+          for bench_name, cmd, metric, unit, direction in benchmarks:
+              glibc_vals = []
+              aeth_vals = []
+              for i in range(runs):
+                  try:
+                      out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      parts = metric.split(".")
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      glibc_vals.append(val)
+                  except:
+                      pass
+                  try:
+                      out = subprocess.check_output(f"LD_PRELOAD={LIB_PATH} {cmd}", shell=True, stderr=subprocess.STDOUT, timeout=120).decode()
+                      d = json.loads(out.strip())
+                      val = d
+                      for p in parts:
+                          val = val.get(p, 0) if isinstance(val, dict) else 0
+                      aeth_vals.append(val)
+                  except:
+                      pass
+              if glibc_vals or aeth_vals:
+                  raw[bench_name] = {
+                      "glibc": {"mean": statistics.mean(glibc_vals) if glibc_vals else 0, "stdev": statistics.stdev(glibc_vals) if len(glibc_vals) > 1 else 0, "runs": glibc_vals},
+                      "aethalloc": {"mean": statistics.mean(aeth_vals) if aeth_vals else 0, "stdev": statistics.stdev(aeth_vals) if len(aeth_vals) > 1 else 0, "runs": aeth_vals},
+                  }
+          with open("benchmark-results.json", "w") as f:
+              json.dump(raw, f, indent=2)
+          PYEOF
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
